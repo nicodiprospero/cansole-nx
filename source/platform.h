@@ -1,0 +1,38 @@
+// CANsole NX - platform interface (Switch implementation in main.c, test stubs in host/)
+#pragma once
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct {
+    uint32_t id;
+    uint8_t len;   // 0-8 (CAN-FD frames are truncated to 8 for display)
+    uint8_t ext;   // 29-bit id
+    uint8_t data[8];
+} CanFrame;
+
+// ---- USB-CAN adapter (slcan over USB CDC-ACM, e.g. RAMN ECU A / CANable)
+enum { USB_OFF = 0, USB_SEARCHING = 1, USB_CONNECTED = 2, USB_ERROR = 3 };
+int plat_usb_state(void);
+const char *plat_usb_label(void);           // short human-readable status
+int plat_usb_poll(CanFrame *out, int max);  // frames received since last call
+bool plat_usb_send(const CanFrame *f);
+
+// ---- Joy-Con NFC reader
+enum { NFC_OFF = 0, NFC_ERROR = 1, NFC_SEARCHING = 2, NFC_TAG = 3 };
+typedef struct {
+    int state;
+    char status[96];
+    uint8_t uid[10];
+    int uid_len;
+    uint32_t protocol, tag_type;
+    uint32_t seq;  // increments every time a new tag is read
+} NfcInfo;
+void plat_nfc_enable(bool on);
+void plat_nfc_info(NfcInfo *out);
+
+// ---- Joy-Con IR camera
+void plat_ir_enable(bool on);
+const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len);  // 8-bit grayscale or NULL
+
+// ---- files
+const char *plat_data_dir(void);  // folder for candump logs, with trailing slash

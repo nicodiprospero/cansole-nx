@@ -1,0 +1,35 @@
+name: build-nro
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .nro
+        run: make -j"$(nproc)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cansole-nx
+          path: cansole-nx.nro
+
+      - name: Publish release (download this on your phone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: CANsole NX build ${{ github.run_number }}
+          body: |
+            Copy `cansole-nx.nro` to `/switch/cansole-nx/` on your SD card, then open it from the Homebrew Menu (hold R while opening a game for full RAM).
+          files: cansole-nx.nro
+          make_latest: true
