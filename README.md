@@ -12,9 +12,25 @@ A native Switch homebrew app (`.nro`) that turns the console into a CAN bus atta
 | **NFC** *(experimental)* | The right Joy-Con's NFC reader shows the UID, protocol and chip type of badges, cards and amiibo. Read-only. |
 | **IR CAM** *(experimental)* | Live feed from the Joy-Con IR camera with a thermal colour map. It can see TV remotes, Face ID emitters and the IR LEDs on CCTV cameras. |
 
+### Attack → detect → defend, in 3 acts (virtual car)
+- **L1 naive replay**: caught by the counter check and the rate IDS.
+- **L2 forged counter + checksum**: the payload checks pass, but the rate doubles and gets caught.
+- **L3 bus-off masquerade**: the real ECU is silenced and the attacker matches rate, counter and checksum. The IDS shows nothing.
+- **SecOC ON**: the receiver verifies a truncated SipHash-2-4 MAC and rejects every forgery (spoofing stopped; denial of service remains).
+
+D-pad **Up** cycles the attack level and **Down** toggles SecOC. Idle for 45 s and the app plays this story by itself.
+
+### RAMN mode (Toyota's RAMN testbed)
+The app auto-detects RAMN from its signal IDs, using names and encodings from the RAMN firmware: brake 0x024, accel 0x039, steering 0x062, gear 0x077, lights 0x150, turn 0x1A7, key 0x1B8, LEDs 0x1BB, park brake 0x1D3.
+- **Framing-aware sniffer:** `[signal 16b BE][freshness counter 16b BE][CRC32 LE]`. Each CRC is verified live.
+- **Dashboard:** steering wheel, pedals, gear, key, light switch, and a mirror of ECU D's own LED report.
+- **Armed attacks:** forged hazards, check engine, high beam and park brake. Each forged frame continues the real counter and carries a valid CRC32, and the IDS flags the counter collisions.
+
 ### Real car bus over USB-C (RAMN / CANable)
 Plug in a USB-CAN adapter that speaks **slcan** over USB serial, such as a RAMN board or a CANable with slcan firmware. The app switches to the real bus automatically at 500 kbit/s.
-- It starts **read-only**. Hold **+** for 2 seconds to arm TX. Only do this on a bus you own or have permission to test.
+- It starts **read-only**: the adapter is opened in slcan **listen-only** (`L`). Hold **+** for 2 seconds to arm TX, which reopens it in normal mode (`O`). Only do this on a bus you own or have permission to test.
+- **Safe mode:** hold **ZL** while launching to disable USB, NFC and IR. A boot log is written to `sdmc:/switch/cansole-nx/boot.log`.
+- See **[DEMO.md](DEMO.md)** for the full demo script.
 - Unplug the adapter and it goes back to the virtual car.
 
 ## Install (phone only, no PC)
