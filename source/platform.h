@@ -16,6 +16,8 @@ int plat_usb_state(void);
 const char *plat_usb_label(void);           // short human-readable status
 int plat_usb_poll(CanFrame *out, int max);  // frames received since last call
 bool plat_usb_send(const CanFrame *f);
+// Bus-level safety: false = adapter opened listen-only ("L"), true = normal mode ("O") so we may transmit.
+void plat_usb_set_tx(bool enable);
 
 // ---- Joy-Con NFC reader
 enum { NFC_OFF = 0, NFC_ERROR = 1, NFC_SEARCHING = 2, NFC_TAG = 3 };
@@ -34,5 +36,10 @@ void plat_nfc_info(NfcInfo *out);
 void plat_ir_enable(bool on);
 const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len);  // 8-bit grayscale or NULL
 
-// ---- files
+// ---- files / diagnostics
 const char *plat_data_dir(void);  // folder for candump logs, with trailing slash
+void plat_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));  // boot.log on SD
+bool plat_safe_mode(void);        // true if launched holding ZL: USB/NFC/IR disabled
+
+// ---- haptics
+void plat_rumble(float amp, int ms);  // Joy-Con HD rumble pulse (amp 0..1)

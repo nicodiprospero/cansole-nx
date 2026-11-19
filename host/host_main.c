@@ -1,5 +1,8 @@
 // Host test harness: stub platform + scripted input, writes PPM screenshots.
+// The USB stub emulates a RAMN board (stock firmware framing: [signal BE][counter BE][CRC32 LE]),
+// including ECU D computing its LEDs from the frames it receives - so forged frames light "LEDs".
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,29 +12,90 @@
 static double T;
 static int usb_state_v = USB_SEARCHING;
 static char usb_label[64] = "USB: none";
+static int usb_tx_mode;  // 0 listen-only, 1 normal
 int plat_usb_state(void) { return usb_state_v; }
 const char *plat_usb_label(void) { return usb_label; }
+void plat_usb_set_tx(bool en) { usb_tx_mode = en; fprintf(stderr, "[usb] adapter mode %s\n", en ? "O (normal)" : "L (listen-only)"); }
+void plat_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); fprintf(stderr, "[log] "); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap); }
+bool plat_safe_mode(void) { return false; }
+static int rumbles;
+void plat_rumble(float amp, int ms) { rumbles++; }
+
+static uint32_t crc32b(const uint8_t *p, int n) {
+    uint32_t c = 0xFFFFFFFF;
+    while (n--) { c ^= *p++; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u))); }
+    return ~c;
+}
+// --- emulated RAMN
+static uint16_t ctr[0x800];
+static uint16_t turn_val, lights_val = 0x0001, pbrake_val;  // what ECU D last received
+static double last_forged_turn = -10, last_forged_lights = -10, last_forged_pb = -10;
+static int emit(char *buf, uint32_t id, uint16_t sig, int sig8) {
+    uint8_t d[8];
+    if (sig8) { d[0] = (uint8_t)sig; d[1] = 0xFF; } else { d[0] = sig >> 8; d[1] = sig & 255; }
+    uint16_t c = ctr[id]++;
+    d[2] = c >> 8; d[3] = c & 255;
+    uint32_t crc = crc32b(d, 4);
+    d[4] = crc; d[5] = crc >> 8; d[6] = crc >> 16; d[7] = crc >> 24;
+    int n = sprintf(buf, "t%03X8", id);
+    for (int i = 0; i < 8; i++) n += sprintf(buf + n, "%02X", d[i]);
+    buf[n++] = '\r';
+    buf[n] = 0;
+    return n;
+}
 static SlcanParser P;
 int plat_usb_poll(CanFrame *out, int max) {
-    // emulate a RAMN-ish bus through the real slcan parser: pedal 0x039, steering 0x062, counter 0x150
-    static double last = 0;
+    static double last_fast = 0, last_slow = 0;
     if (usb_state_v != USB_CONNECTED) return 0;
-    char buf[2048]; int n = 0;
-    while (last + 0.01 <= T) {
-        last += 0.01;
-        int pedal = (int)(2048 + 2000 * sin(last * 1.3));
-        int steer = (int)(1000 * sin(last * 0.4)) & 0xFFFF;
-        static int c = 0; c = (c + 1) & 0xFF;
-        n += sprintf(buf + n, "t0392%02X%02X\r", pedal >> 8, pedal & 255);
-        n += sprintf(buf + n, "t0624%02X%02X%02X00\r", steer >> 8, steer & 255, c);
-        if (c % 10 == 0) n += sprintf(buf + n, "T18DAF1108%02X1122334455667\r", c); // malformed tail ok
-        if (c % 5 == 0) n += sprintf(buf + n, "t1503%02XAB01\r", c);
-        if (n > 1800) break;
+    char buf[4096];
+    int n = 0;
+    while (last_fast + 0.01 <= T && n < 3500) {
+        last_fast += 0.01;
+        n += emit(buf + n, 0x024, (uint16_t)(fmax(0, 900 * sin(last_fast * 0.9))), 0);          // brake
+        n += emit(buf + n, 0x039, (uint16_t)(2048 + 2000 * sin(last_fast * 1.3)), 0);           // accel
+        n += emit(buf + n, 0x062, (uint16_t)(2047 + 1500 * sin(last_fast * 0.5)), 0);           // steering
+        n += emit(buf + n, 0x043, (uint16_t)(1200 + 800 * sin(last_fast)), 0);                  // rpm status
+    }
+    while (last_slow + 0.1 <= T && n < 3500) {
+        last_slow += 0.1;
+        n += emit(buf + n, 0x077, 3, 1);                                                    // gear 3
+        n += emit(buf + n, 0x150, 0x0003, 0);                                               // light switch: LOW
+        n += emit(buf + n, 0x1A7, 0x0000, 0);                                               // no turn signal
+        n += emit(buf + n, 0x1B8, 3, 1);                                                    // key IGN
+        n += emit(buf + n, 0x1D3, 0, 1);                                                    // park brake down
+        // ECU D: LEDs from what it received last (forged frames win while attack runs)
+        uint16_t tv = (T - last_forged_turn < 0.2) ? turn_val : 0;
+        uint16_t lv = (T - last_forged_lights < 0.2) ? lights_val : 0x0003;
+        uint8_t pb = (T - last_forged_pb < 0.2) ? (uint8_t)pbrake_val : 0;
+        uint8_t led = 0x01;  // battery (key IGN)
+        if (lv & 0xFF00) led |= 0x02;
+        if (pb) led |= 0x04;
+        int pos = lv & 0xFF;
+        if (pos >= 2) led |= 0x08;
+        if (pos >= 3) led |= 0x10;
+        if (pos >= 4) led |= 0x20;
+        bool blink = fmod(T, 1.0) >= 0.5;
+        if ((tv & 0xFF00) && blink) led |= 0x40;
+        if ((tv & 0x00FF) && blink) led |= 0x80;
+        n += emit(buf + n, 0x1BB, led, 1);
     }
     return slcan_feed(&P, (const uint8_t *)buf, n, out, max);
 }
 static int sent;
-bool plat_usb_send(const CanFrame *f) { char b[64]; slcan_encode(f, b); sent++; if (sent < 3) fprintf(stderr, "TX %s\n", b); return true; }
+bool plat_usb_send(const CanFrame *f) {
+    char b[64];
+    slcan_encode(f, b);
+    if (!usb_tx_mode) { fprintf(stderr, "!! TX while listen-only: %s\n", b); return false; }
+    sent++;
+    if (sent <= 2) fprintf(stderr, "TX %s\n", b);
+    // verify the forged CRC like an IDS would
+    if (f->len == 8 && crc32b(f->data, 4) != ((uint32_t)f->data[4] | f->data[5] << 8 | f->data[6] << 16 | (uint32_t)f->data[7] << 24))
+        fprintf(stderr, "!! bad forged CRC on %03X\n", f->id);
+    if (f->id == 0x1A7) { turn_val = f->data[0] | f->data[1] << 8; last_forged_turn = T; }
+    if (f->id == 0x150) { lights_val = f->data[0] << 8 | f->data[1]; last_forged_lights = T; }
+    if (f->id == 0x1D3) { pbrake_val = f->data[0]; last_forged_pb = T; }
+    return true;
+}
 static bool nfc_on;
 void plat_nfc_enable(bool on) { nfc_on = on; }
 void plat_nfc_info(NfcInfo *o) {
@@ -64,67 +128,77 @@ static void save(const char *name) {
     fclose(f);
 }
 
+typedef struct { double at; uint32_t held; float stick; int usb; const char *shot; } Step;
+
+static int attract_test(void) {
+    Canvas c = {fb, 1280, 720, 1280};
+    app_init();
+    Input in; memset(&in, 0, sizeof in);
+    // idle 45 s -> attract starts at t=45 (p=0). Snap key moments of the 44 s story.
+    double snaps[] = {45 + 9.5, 45 + 13.5, 45 + 21, 45 + 28, 45 + 33, 45 + 38};
+    const char *names[] = {"A1_L1", "A2_L2", "A3_L3_blind", "A4_secoc", "A5_ids", "A6_sniffer"};
+    int k = 0;
+    for (T = 0; T < 45 + 39; T += 1.0 / 60) {
+        app_frame(&c, &in, T);
+        if (k < 6 && T >= snaps[k]) save(names[k++]);
+    }
+    app_shutdown();
+    return 0;
+}
+
 int main(void) {
+    if (getenv("ATTRACT")) return attract_test();
     Canvas c = {fb, 1280, 720, 1280};
     app_init();
     Input in; memset(&in, 0, sizeof in);
     uint32_t prev = 0;
-    struct { double at; uint32_t held; float stick; int touch, tx, ty; int usb; const char *shot; } S[] = {
-        {0.0, 0, 0.9f, 0, 0, 0, 0, NULL},
-        {8.0, 0, 0.9f, 0, 0, 0, 0, "01_cluster_driving"},
-        {9.0, B_ZR, 0.5f, 0, 0, 0, 0, NULL},
-        {10.5, B_ZR, 0.5f, 0, 0, 0, 0, "02_cluster_spoof"},
-        {11.0, B_A, 0.5f, 0, 0, 0, 0, NULL},
-        {11.1, 0, 0.5f, 0, 0, 0, 0, NULL},
-        {11.6, 0, 0.5f, 0, 0, 0, 0, "03_doors_unlocked"},
-        {12.0, B_R, 0.5f, 0, 0, 0, 0, NULL},
-        {12.1, B_DOWN, 0.5f, 0, 0, 0, 0, NULL},
-        {12.2, 0, 0.5f, 0, 0, 0, 0, NULL},
-        {14.0, 0, 0.5f, 0, 0, 0, 0, "04_sniffer"},
-        {14.1, B_R, 0.5f, 0, 0, 0, 0, NULL},
-        {14.2, B_ZR, 0.5f, 0, 0, 0, 0, NULL},
-        {16.0, B_ZR, 0.5f, 0, 0, 0, 0, "05_ids"},
-        {16.1, B_R, 0.0f, 0, 0, 0, 0, NULL},
-        {16.2, 0, 0.0f, 0, 0, 0, 0, NULL},
-        {19.0, 0, 0.0f, 0, 0, 0, 0, "06_nfc"},
-        {19.1, B_R, 0.0f, 0, 0, 0, 0, NULL},
-        {19.2, 0, 0.0f, 0, 0, 0, 0, NULL},
-        {20.0, 0, 0.0f, 0, 0, 0, 0, "07_ir"},
-        {20.1, 0, 0.0f, 1, 300, 28, 0, NULL},   // touch CLUSTER tab... (x=300 -> tab 0 at 182..298? tab1)
-        {20.2, 0, 0.0f, 0, 0, 0, 1, NULL},      // plug USB
-        {23.0, 0, 0.0f, 0, 0, 0, 1, "08_usb_sniffer"},
-        {23.1, B_A, 0.0f, 0, 0, 0, 1, NULL},     // pin 0x039 byte0
-        {23.2, 0, 0.0f, 0, 0, 0, 1, NULL},
-        {23.3, B_L, 0.0f, 0, 0, 0, 1, NULL},
-        {23.4, B_ZR, 0.0f, 0, 0, 0, 1, NULL},    // locked -> toast
-        {26.0, B_ZR, 0.0f, 0, 0, 0, 1, "09_usb_cluster_pinned"},
-        {26.1, B_PLUS, 0.0f, 0, 0, 0, 1, NULL},
-        {28.3, 0, 0.0f, 0, 0, 0, 1, NULL},
-        {28.4, B_ZR, 0.0f, 0, 0, 0, 1, NULL},
-        {29.5, B_ZR, 0.0f, 0, 0, 0, 1, "10_usb_armed_override"},
-        {29.6, B_MINUS, 0.0f, 0, 0, 0, 1, NULL},
-        {29.8, B_MINUS, 0.0f, 0, 0, 0, 1, "11_help"},
-        {30.0, 0, 0.0f, 0, 0, 0, 0, NULL},
-        {31.0, 0, 0.0f, 0, 0, 0, 0, "12_unplugged"},
-        {80.0, 0, 0.0f, 0, 0, 0, 0, "13_attract"},
-        {80.1, 0, 0.0f, 0, 0, 0, 0, NULL},
+    Step S[] = {
+        {0.0, 0, 0.9f, 0, NULL},
+        {8.0, 0, 0.9f, 0, "01_cluster_driving"},
+        {9.0, B_ZR, 0.5f, 0, NULL},                      // L1 naive spoof
+        {10.5, B_ZR, 0.5f, 0, "02_L1_spoof_caught"},
+        {11.0, B_UP, 0.5f, 0, NULL}, {11.1, 0, 0.5f, 0, NULL},          // -> L2
+        {12.0, B_ZR, 0.5f, 0, NULL},
+        {13.5, B_ZR, 0.5f, 0, "03_L2_forged_caught"},
+        {14.0, B_UP, 0.5f, 0, NULL}, {14.1, 0, 0.5f, 0, NULL},          // -> L3
+        {17.5, B_ZR, 0.5f, 0, NULL},                     // after cooldown: masquerade
+        {21.0, B_ZR, 0.5f, 0, "04_L3_ids_blind"},
+        {21.5, B_DOWN, 0.5f, 0, NULL}, {21.6, 0, 0.5f, 0, NULL},        // SecOC ON (relearn 6s)
+        {29.0, B_ZR, 0.5f, 0, NULL},
+        {31.0, B_ZR, 0.5f, 0, "05_L3_secoc_blocks"},
+        {31.5, B_R, 0.5f, 0, NULL}, {31.6, B_R, 0.5f, 0, NULL}, {31.7, 0, 0.5f, 0, NULL},
+        {32.0, B_ZR, 0.5f, 0, NULL},
+        {33.0, B_ZR, 0.5f, 0, "06_ids_secoc"},
+        {33.5, B_L, 0.5f, 0, NULL}, {33.6, B_L, 0.5f, 0, NULL}, {33.7, 0, 0.0f, 0, NULL},  // back to cluster
+        {34.0, 0, 0.0f, 1, NULL},                        // plug RAMN
+        {38.0, 0, 0.0f, 1, "07_ramn_sniffer"},
+        {38.1, B_L, 0.0f, 1, NULL}, {38.2, 0, 0.0f, 1, NULL},
+        {39.0, 0, 0.0f, 1, "08_ramn_dash_readonly"},
+        {39.2, B_A, 0.0f, 1, NULL}, {39.3, 0, 0.0f, 1, NULL},           // try hazards while locked -> toast
+        {39.6, B_PLUS, 0.0f, 1, NULL},                   // arm (hold 2s)
+        {41.8, 0, 0.0f, 1, NULL},
+        {42.0, B_A, 0.0f, 1, NULL}, {42.1, 0, 0.0f, 1, NULL},           // hazards
+        {42.3, B_B, 0.0f, 1, NULL}, {42.4, 0, 0.0f, 1, NULL},           // check engine
+        {43.6, 0, 0.0f, 1, "09_ramn_hazards_check_engine"},
+        {44.2, 0, 0.0f, 1, "10_ramn_hazards_blink_off"},
+        {44.5, B_R, 0.0f, 1, NULL}, {44.6, B_R, 0.0f, 1, NULL}, {44.7, 0, 0.0f, 1, NULL},
+        {45.0, 0, 0.0f, 1, "11_ramn_ids"},
+        {45.2, 0, 0.0f, 0, NULL},
+        {46.0, 0, 0.0f, 0, "12_unplugged"},
+        {46.1, 0, 0.0f, 0, NULL},
     };
-    int ns = sizeof S / sizeof S[0], si = 0;
-    int frames = 0;
-    for (T = 0; T < 80.2; T += 1.0 / 60) {
+    int ns = sizeof S / sizeof S[0], si = 0, last_si = -1;
+    for (T = 0; T < 46.2; T += 1.0 / 60) {
         while (si + 1 < ns && S[si + 1].at <= T) si++;
         usb_state_v = S[si].usb ? USB_CONNECTED : USB_SEARCHING;
         snprintf(usb_label, sizeof usb_label, S[si].usb ? "USB 0483:5740 slcan 500k" : "USB: none");
         in.held = S[si].held; in.down = in.held & ~prev; in.up = prev & ~in.held; prev = in.held;
-        in.stick_y = S[si].stick; in.touching = S[si].touch; in.tx = S[si].tx; in.ty = S[si].ty;
+        in.stick_y = S[si].stick; in.touching = false;
         if (!app_frame(&c, &in, T)) { printf("quit at %.2f\n", T); break; }
-        frames++;
-        if (S[si].shot && fabs(T - S[si].at) < 1.0 / 120 + 1e-9) save(S[si].shot);
-        static int last_si = -1;
-        if (S[si].shot && si != last_si) { save(S[si].shot); }
+        if (S[si].shot && si != last_si) save(S[si].shot);
         last_si = si;
     }
-    printf("frames=%d sent=%d\n", frames, sent);
+    printf("sent=%d rumbles=%d\n", sent, rumbles);
     app_shutdown();
     return 0;
 }

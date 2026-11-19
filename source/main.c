@@ -2,6 +2,7 @@
 //   framebuffer + Joy-Con/touch input, USB-CAN (slcan over CDC-ACM via usb:hs),
 //   Joy-Con NFC (nfc:user) and Joy-Con IR camera (irs).
 #include <malloc.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -11,6 +12,63 @@
 #include "slcan.h"
 
 static PadState g_pad;
+static bool g_safe_mode;
+static u64 g_t0;
+
+// ================================================================ boot log
+static Mutex log_mtx;
+static FILE *bootlog;
+void plat_log(const char *fmt, ...) {
+    mutexLock(&log_mtx);
+    if (!bootlog) {
+        mkdir("sdmc:/switch", 0777);
+        mkdir("sdmc:/switch/cansole-nx", 0777);
+        bootlog = fopen("sdmc:/switch/cansole-nx/boot.log", "a");
+    }
+    if (bootlog) {
+        va_list ap;
+        va_start(ap, fmt);
+        fprintf(bootlog, "[%8.3f] ", armTicksToNs(armGetSystemTick() - g_t0) / 1e9);
+        vfprintf(bootlog, fmt, ap);
+        fputc('\n', bootlog);
+        fflush(bootlog);
+        va_end(ap);
+    }
+    mutexUnlock(&log_mtx);
+}
+bool plat_safe_mode(void) { return g_safe_mode; }
+
+// ================================================================== rumble
+static HidVibrationDeviceHandle vib_hh[2], vib_p1[2];
+static bool vib_ok_hh, vib_ok_p1;
+static u64 vib_stop;
+static void rumble_send(float amp) {
+    HidVibrationValue v[2];
+    for (int i = 0; i < 2; i++) {
+        v[i].amp_low = amp;
+        v[i].freq_low = 160.0f;
+        v[i].amp_high = amp;
+        v[i].freq_high = 320.0f;
+    }
+    if (vib_ok_hh) hidSendVibrationValues(vib_hh, v, 2);
+    if (vib_ok_p1) hidSendVibrationValues(vib_p1, v, 2);
+}
+void plat_rumble(float amp, int ms) {
+    if (amp > 1) amp = 1;
+    rumble_send(amp);
+    vib_stop = armGetSystemTick() + armNsToTicks((u64)ms * 1000000ULL);
+}
+static void rumble_init(void) {
+    vib_ok_hh = R_SUCCEEDED(hidInitializeVibrationDevices(vib_hh, 2, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld));
+    vib_ok_p1 = R_SUCCEEDED(hidInitializeVibrationDevices(vib_p1, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual));
+    plat_log("rumble handheld=%d p1=%d", vib_ok_hh, vib_ok_p1);
+}
+static void rumble_poll(void) {
+    if (vib_stop && armGetSystemTick() >= vib_stop) {
+        rumble_send(0);
+        vib_stop = 0;
+    }
+}
 
 // =================================================================== USB-CAN
 #define RXQ 4096
@@ -29,6 +87,7 @@ static UsbHsClientEpSession ep_in, ep_out;
 static bool have_if, have_in, have_out;
 static u8 *usb_inbuf, *usb_outbuf;
 static SlcanParser slp;
+static volatile int usb_mode_req;  // 0 none, 1 listen-only, 2 normal (TX)
 
 static void set_label(const char *s) {
     mutexLock(&usb_mtx);
@@ -89,9 +148,11 @@ static bool usb_try_open(void) {
     u32 xfer = 0;
     usbHsIfCtrlXfer(&if_sess, 0x21, 0x20, 0, ctrl_if, 7, lc, &xfer);
     usbHsIfCtrlXfer(&if_sess, 0x21, 0x22, 0x03, ctrl_if, 0, lc, &xfer);
-    // slcan: close, 500 kbit/s, open
-    static const char init[] = "\r\r\rC\rS6\rO\r";
+    // slcan: close, 500 kbit/s, open LISTEN-ONLY (the adapter itself cannot transmit until armed)
+    static const char init[] = "\r\r\rC\rS6\rL\r";
     usb_write(init, (int)sizeof(init) - 1);
+    plat_log("usb: opened %04X:%04X if=%d ctrl_if=%d (listen-only)", ifs[0].device_desc.idVendor, ifs[0].device_desc.idProduct,
+             if_sess.inf.inf.interface_desc.bInterfaceNumber, ctrl_if);
     char lab[64];
     snprintf(lab, sizeof(lab), "USB %04X:%04X slcan 500k", ifs[0].device_desc.idVendor, ifs[0].device_desc.idProduct);
     set_label(lab);
@@ -122,6 +183,14 @@ static void usb_main(void *arg) {
             usb_state_v = USB_CONNECTED;
             posted = false;
             fails = 0;
+        }
+        // adapter mode change (listen-only <-> normal)
+        int req = usb_mode_req;
+        if (req) {
+            usb_mode_req = 0;
+            const char *cmd = req == 2 ? "C\rS6\rO\r" : "C\rS6\rL\r";
+            usb_write(cmd, (int)strlen(cmd));
+            plat_log("usb: mode %s", req == 2 ? "NORMAL (TX armed)" : "LISTEN-ONLY");
         }
         // flush pending TX
         mutexLock(&usb_mtx);
@@ -171,6 +240,7 @@ static void usb_main(void *arg) {
         if (fails > 20 || armTicksToNs(nowt - last_check) > 1000000000ULL) {
             last_check = nowt;
             if (fails > 20 || !usb_still_there()) {
+                plat_log("usb: device lost (fails=%d)", fails);
                 usb_close_dev();
                 usb_state_v = USB_SEARCHING;
                 posted = false;
@@ -182,11 +252,19 @@ static void usb_main(void *arg) {
     usb_close_dev();
 }
 
+void plat_usb_set_tx(bool enable) { usb_mode_req = enable ? 2 : 1; }
+
 static void usb_start(void) {
     mutexInit(&usb_mtx);
+    if (g_safe_mode) {
+        usb_state_v = USB_OFF;
+        snprintf(usb_label_s, sizeof(usb_label_s), "USB off (safe mode)");
+        return;
+    }
     usb_inbuf = memalign(0x1000, 0x1000);
     usb_outbuf = memalign(0x1000, 0x1000);
     Result rc = usbHsInitialize();
+    plat_log("usbHsInitialize rc=0x%X", (unsigned)rc);
     if (R_FAILED(rc) || !usb_inbuf || !usb_outbuf) {
         usb_state_v = USB_ERROR;
         snprintf(usb_label_s, sizeof(usb_label_s), "USB host unavailable (0x%X)", (unsigned)rc);
@@ -208,7 +286,7 @@ static void usb_stop(void) {
         threadClose(&usb_thread);
         usb_thread_ok = false;
     }
-    if (usb_state_v != USB_ERROR) usbHsExit();
+    if (usb_state_v != USB_ERROR && !g_safe_mode) usbHsExit();
 }
 
 int plat_usb_state(void) { return usb_state_v; }
@@ -254,9 +332,15 @@ static NfcInfo nfc_cur;
 static int nfc_prev_state = -1;
 
 void plat_nfc_enable(bool on) {
+    if (on && g_safe_mode) {
+        nfc_cur.state = NFC_ERROR;
+        snprintf(nfc_cur.status, sizeof(nfc_cur.status), "NFC disabled (safe mode)");
+        return;
+    }
     if (on && !nfc_inited) {
         memset(&nfc_cur, 0, sizeof(nfc_cur));
         Result rc = nfcInitialize(NfcServiceType_User);
+        plat_log("nfcInitialize rc=0x%X", (unsigned)rc);
         if (R_FAILED(rc)) {
             nfc_cur.state = NFC_ERROR;
             snprintf(nfc_cur.status, sizeof(nfc_cur.status), "NFC service unavailable (0x%X)", (unsigned)rc);
@@ -328,8 +412,13 @@ static char ir_status[96] = "";
 #define IR_H 240
 
 void plat_ir_enable(bool on) {
+    if (on && g_safe_mode) {
+        snprintf(ir_status, sizeof(ir_status), "IR disabled (safe mode)");
+        return;
+    }
     if (on && !ir_inited) {
         Result rc = irsInitialize();
+        plat_log("irsInitialize rc=0x%X", (unsigned)rc);
         if (R_FAILED(rc)) {
             snprintf(ir_status, sizeof(ir_status), "IR service unavailable (0x%X)", (unsigned)rc);
             return;
@@ -344,6 +433,7 @@ void plat_ir_enable(bool on) {
             rc = irsRunImageTransferProcessor(ir_handle, &cfg, 0x100000);
         }
         ir_running = R_SUCCEEDED(rc);
+        plat_log("ir start rc=0x%X running=%d", (unsigned)rc, ir_running);
         if (ir_running)
             snprintf(ir_status, sizeof(ir_status), "IR camera running (%s)", id == HidNpadIdType_Handheld ? "handheld" : "player 1");
         else
@@ -396,9 +486,18 @@ static uint32_t map_buttons(u64 k) {
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    g_t0 = armGetSystemTick();
+    mutexInit(&log_mtx);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&g_pad);
     hidInitializeTouchScreen();
+    for (int i = 0; i < 4; i++) {  // hold ZL while launching = safe mode
+        padUpdate(&g_pad);
+        if (padGetButtons(&g_pad) & HidNpadButton_ZL) g_safe_mode = true;
+        svcSleepThread(15000000ULL);
+    }
+    plat_log("---- CANsole NX " APP_VERSION_STR " start (safe_mode=%d, applet=%d)", g_safe_mode, (int)appletGetAppletType());
+    rumble_init();
     appletSetMediaPlaybackState(true);  // keep the screen on in demo mode
 
     NWindow *win = nwindowGetDefault();
@@ -410,7 +509,9 @@ int main(int argc, char **argv) {
     app_init();
     u64 t_start = armGetSystemTick();
 
+    plat_log("framebuffer + app init ok");
     while (appletMainLoop()) {
+        rumble_poll();
         padUpdate(&g_pad);
         Input in;
         memset(&in, 0, sizeof(in));
@@ -435,9 +536,13 @@ int main(int argc, char **argv) {
         if (!keep) break;
     }
 
+    plat_log("exit requested");
+    rumble_send(0);
     app_shutdown();
     usb_stop();
     framebufferClose(&fb);
     appletSetMediaPlaybackState(false);
+    plat_log("clean exit");
+    if (bootlog) fclose(bootlog);
     return 0;
 }
