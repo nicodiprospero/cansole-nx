@@ -104,6 +104,7 @@ static int br_idx;
 static u64 last_rx_tick;
 static bool ever_rx;
 static u32 gs_echo;
+static bool listen_fallback;  // adapter seems to ignore listen-only: open normally (UI still blocks TX until armed)
 
 static void set_label(const char *s) {
     mutexLock(&usb_mtx);
@@ -168,7 +169,8 @@ static bool open_bulk_eps(void) {
 // ---- slcan
 static void slcan_open_cmd(int mode) {
     char cmd[32];
-    snprintf(cmd, sizeof(cmd), "\rC\rS%d\r%c\r", BR_CODES[br_idx], mode == 2 ? 'O' : 'L');
+    int eff = (mode == 1 && listen_fallback) ? 2 : mode;
+    snprintf(cmd, sizeof(cmd), "\rC\rS%d\r%c\r", BR_CODES[br_idx], eff == 2 ? 'O' : 'L');
     usb_write(cmd, (int)strlen(cmd));
     usb_cur_mode = mode;
 }
@@ -231,7 +233,7 @@ static void gs_set_mode(int mode) {
     u32 seg2 = tq / 8 > 1 ? tq / 8 : 2;  // ~87.5% sample point
     u32 bt[5] = {1, tq - 1 - 1 - seg2, seg2, 1, brp ? brp : 1};  // prop, phase1, phase2, sjw, brp
     gs_ctrl_out(1, 0, bt, 20);
-    u32 start[2] = {1, mode == 2 ? 0u : 1u};  // start, flags: LISTEN_ONLY
+    u32 start[2] = {1, (mode == 2 || listen_fallback) ? 0u : 1u};  // start, flags: LISTEN_ONLY
     Result rc = gs_ctrl_out(2, 0, start, 8);
     usb_cur_mode = mode;
     plat_log("usb: gs_usb fclk=%u tq=%u brp=%u %dk mode=%s rc=0x%X", (unsigned)fclk, (unsigned)tq, (unsigned)brp, BR_KBPS[br_idx],
@@ -308,6 +310,7 @@ static void usb_main(void *arg) {
             posted = false;
             fails = 0;
             ever_rx = false;
+            listen_fallback = false;
             last_rx_tick = armGetSystemTick();
             update_label();
         }
@@ -384,6 +387,10 @@ static void usb_main(void *arg) {
             last_rx_tick = nowt;
             if (!ever_rx && usb_cur_mode == 1) {
                 br_idx = (br_idx + 1) % 6;
+                if (br_idx == 0) {
+                    listen_fallback = !listen_fallback;
+                    plat_log("usb: full bitrate cycle silent, listen-only fallback=%d", listen_fallback);
+                }
                 plat_log("usb: no frames, trying %dk", BR_KBPS[br_idx]);
             } else {
                 plat_log("usb: stream stopped, reopening at %dk", BR_KBPS[br_idx]);

@@ -1195,10 +1195,13 @@ static uint16_t tko_accel, tko_brake, tko_steer = 0x7FF;
 static int tko_gear = 1, tko_blink;  // blink: 0 off, 1 left, 2 right, 3 hazard
 static bool tko_horn;
 static int tko_alerts0;
+static bool tko_collide;  // could not power off ECU B/C (no RAMN USB serial): real ECUs keep talking
 
 static void tko_start(double t) {
     if (!can_tx(t)) return;
-    if (!ecu_power_set(0, false, t) || !ecu_power_set(1, false, t)) return;
+    bool pb = ecu_power_set(0, false, t);
+    bool pc = pb && ecu_power_set(1, false, t);
+    tko_collide = !(pb && pc);
     tko_on = true;
     tko_t0 = t;
     for (int i = 0; i < 8; i++) tko_last[i] = t;
@@ -1207,15 +1210,20 @@ static void tko_start(double t) {
     (void)ok;
     if (e && e->len >= 1 && e->data[0] >= 1 && e->data[0] <= 6) tko_gear = e->data[0];
     tko_alerts0 = nalerts;
-    toast(t, "TAKEOVER: ECU B + C powered off, your Joy-Cons ARE the steering wheel and pedals now");
+    if (tko_collide)
+        toast(t, "TAKEOVER (collision mode): ECU power control unavailable - real ECUs still talk, the IDS will see it");
+    else
+        toast(t, "TAKEOVER: ECU B + C powered off, your Joy-Cons ARE the steering wheel and pedals now");
     plat_rumble(0.9f, 300);
 }
 
 static void tko_stop(double t) {
     if (!tko_on) return;
     tko_on = false;
-    ecu_power_set(0, true, t);
-    ecu_power_set(1, true, t);
+    if (!tko_collide) {
+        ecu_power_set(0, true, t);
+        ecu_power_set(1, true, t);
+    }
     toast(t, "Takeover ended - ECU B + C powered back on (watch the IDS: their counters restart at 0)");
     plat_rumble(0.5f, 150);
 }
@@ -2008,8 +2016,11 @@ static void draw_ecu(double t) {
     IdInfo *eb = find_id(R_CTL_STEER), *ec = find_id(R_CTL_ACCEL);
     bool bs = !eb || t - eb->last_ext > 0.3, cs = !ec || t - ec->last_ext > 0.3;
     if (tko_on) {
-        snprintf(buf, sizeof(buf), "ECU B %s   ECU C %s", bs ? "silent OK" : "STILL TALKING", cs ? "silent OK" : "STILL TALKING");
-        txt(&FONT_S, buf, tp.x + 18, tp.y + 150, bs && cs ? GREEN : RED, A_TL);
+        if (tko_collide)
+            snprintf(buf, sizeof(buf), "COLLISION MODE: real ECUs still on the bus");
+        else
+            snprintf(buf, sizeof(buf), "ECU B %s   ECU C %s", bs ? "silent OK" : "STILL TALKING", cs ? "silent OK" : "STILL TALKING");
+        txt(&FONT_S, buf, tp.x + 18, tp.y + 150, (bs && cs && !tko_collide) ? GREEN : AMBER, A_TL);
         // live controls
         float fa = tko_accel / 4095.0f, fb = tko_brake / 4095.0f;
         gfx_rrect(C, tp.x + 18, tp.y + 180, 60, 166, 8, PANEL2);
