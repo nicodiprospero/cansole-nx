@@ -25,8 +25,14 @@ static const int FD_LEN[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48
 
 static int parse_line(const char *l, int n, CanFrame *f) {
     if (n < 1) return 0;
+    int fdpre = 0;
+    if ((l[0] == '0' || l[0] == '1') && n > 1 && (l[1] == 't' || l[1] == 'T' || l[1] == 'r' || l[1] == 'R')) {
+        fdpre = 1;  // RAMN: CAN-FD frames are prefixed '0' (no BRS) / '1' (BRS), DLC is the FD length code
+        l++;
+        n--;
+    }
     char k = l[0];
-    int idlen, fd = 0;
+    int idlen, fd = fdpre;
     switch (k) {
         case 't': idlen = 3; break;
         case 'T': idlen = 8; break;

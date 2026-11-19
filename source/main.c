@@ -71,12 +71,20 @@ static void rumble_poll(void) {
 }
 
 // =================================================================== USB-CAN
+// Two drivers on top of usb:hs:
+//   1) slcan over CDC-ACM (RAMN ECU A 0483:5740, CANable slcan firmware)  <- primary
+//   2) gs_usb / candleLight (1d50:606f)                                    <- fallback
+// Safety: opened LISTEN-ONLY; normal mode only after the user arms TX.
+// Robustness: auto-bitrate search (listen-only, so harmless), reopen watchdog if the stream stops.
 #define RXQ 4096
+enum { KIND_NONE, KIND_SLCAN, KIND_GSUSB };
 static Mutex usb_mtx;
 static CanFrame rxq[RXQ];
 static int rxq_head, rxq_tail;
 static char txq[8192];
 static int txq_len;
+static CanFrame gs_txq[256];
+static int gs_txq_n;
 static volatile int usb_state_v = USB_OFF;
 static char usb_label_s[64] = "USB: off";
 static Thread usb_thread;
@@ -85,9 +93,17 @@ static bool usb_thread_ok;
 static UsbHsClientIfSession if_sess;
 static UsbHsClientEpSession ep_in, ep_out;
 static bool have_if, have_in, have_out;
-static u8 *usb_inbuf, *usb_outbuf;
+static u8 *usb_inbuf, *usb_outbuf, *usb_ctrlbuf;
 static SlcanParser slp;
 static volatile int usb_mode_req;  // 0 none, 1 listen-only, 2 normal (TX)
+static int usb_kind, usb_cur_mode = 1;
+static u16 usb_vid, usb_pid, usb_ifnum;
+static const int BR_CODES[6] = {6, 8, 5, 4, 7, 3};
+static const int BR_KBPS[6] = {500, 1000, 250, 125, 800, 100};
+static int br_idx;
+static u64 last_rx_tick;
+static bool ever_rx;
+static u32 gs_echo;
 
 static void set_label(const char *s) {
     mutexLock(&usb_mtx);
@@ -95,38 +111,49 @@ static void set_label(const char *s) {
     mutexUnlock(&usb_mtx);
 }
 
+static void update_label(void) {
+    char lab[64];
+    if (usb_kind == KIND_SLCAN)
+        snprintf(lab, sizeof(lab), "USB %04X:%04X slcan %dk%s", usb_vid, usb_pid, BR_KBPS[br_idx], ever_rx ? "" : "?");
+    else
+        snprintf(lab, sizeof(lab), "USB %04X:%04X gs_usb %dk%s", usb_vid, usb_pid, BR_KBPS[br_idx], ever_rx ? "" : "?");
+    set_label(lab);
+}
+
 static void usb_close_dev(void) {
     if (have_in) usbHsEpClose(&ep_in);
     if (have_out) usbHsEpClose(&ep_out);
     if (have_if) usbHsIfClose(&if_sess);
     have_in = have_out = have_if = false;
+    usb_kind = KIND_NONE;
 }
 
-static bool usb_write(const char *s, int n) {
+static bool usb_write(const void *s, int n) {
     if (!have_out || n <= 0) return false;
+    const u8 *p = (const u8 *)s;
     while (n > 0) {
         int chunk = n > 0x1000 ? 0x1000 : n;
-        memcpy(usb_outbuf, s, (size_t)chunk);
+        memcpy(usb_outbuf, p, (size_t)chunk);
         u32 xfer = 0;
         if (R_FAILED(usbHsEpPostBuffer(&ep_out, usb_outbuf, (u32)chunk, &xfer))) return false;
-        s += chunk;
+        p += chunk;
         n -= chunk;
     }
     return true;
 }
 
-static bool usb_try_open(void) {
-    UsbHsInterfaceFilter filter;
-    memset(&filter, 0, sizeof(filter));
-    filter.Flags = UsbHsInterfaceFilterFlags_bInterfaceClass;
-    filter.bInterfaceClass = 0x0A;  // CDC data interface (STM32/RAMN, CANable slcan firmware)
-    static UsbHsInterface ifs[8];
-    s32 total = 0;
-    Result rc = usbHsQueryAvailableInterfaces(&filter, ifs, sizeof(ifs), &total);
-    if (R_FAILED(rc) || total <= 0) return false;
-    rc = usbHsAcquireUsbIf(&if_sess, &ifs[0]);
-    if (R_FAILED(rc)) return false;
-    have_if = true;
+static void push_rx(const CanFrame *f, int n) {
+    mutexLock(&usb_mtx);
+    for (int i = 0; i < n; i++) {
+        int nx = (rxq_head + 1) % RXQ;
+        if (nx == rxq_tail) break;  // full: drop
+        rxq[rxq_head] = f[i];
+        rxq_head = nx;
+    }
+    mutexUnlock(&usb_mtx);
+}
+
+static bool open_bulk_eps(void) {
     for (int i = 0; i < 15; i++) {
         struct usb_endpoint_descriptor *d = &if_sess.inf.inf.input_endpoint_descs[i];
         if (!have_in && d->bLength && (d->bmAttributes & 3) == 2 && R_SUCCEEDED(usbHsIfOpenUsbEp(&if_sess, &ep_in, 1, 0x1000, d)))
@@ -135,29 +162,121 @@ static bool usb_try_open(void) {
         if (!have_out && d->bLength && (d->bmAttributes & 3) == 2 && R_SUCCEEDED(usbHsIfOpenUsbEp(&if_sess, &ep_out, 1, 0x1000, d)))
             have_out = true;
     }
-    if (!have_in || !have_out) {
-        usb_close_dev();
-        return false;
-    }
-    // CDC-ACM: line coding 115200 8N1 + DTR/RTS on the control interface (usually data interface - 1)
-    u16 ctrl_if = if_sess.inf.inf.interface_desc.bInterfaceNumber ? if_sess.inf.inf.interface_desc.bInterfaceNumber - 1 : 0;
-    u8 *lc = usb_outbuf;
+    return have_in && have_out;
+}
+
+// ---- slcan
+static void slcan_open_cmd(int mode) {
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "\rC\rS%d\r%c\r", BR_CODES[br_idx], mode == 2 ? 'O' : 'L');
+    usb_write(cmd, (int)strlen(cmd));
+    usb_cur_mode = mode;
+}
+
+static bool try_slcan(void) {
+    UsbHsInterfaceFilter filter;
+    memset(&filter, 0, sizeof(filter));
+    filter.Flags = UsbHsInterfaceFilterFlags_bInterfaceClass;
+    filter.bInterfaceClass = 0x0A;  // CDC data
+    static UsbHsInterface ifs[8];
+    s32 total = 0;
+    if (R_FAILED(usbHsQueryAvailableInterfaces(&filter, ifs, sizeof(ifs), &total)) || total <= 0) return false;
+    if (R_FAILED(usbHsAcquireUsbIf(&if_sess, &ifs[0]))) return false;
+    have_if = true;
+    if (!open_bulk_eps()) { usb_close_dev(); return false; }
+    usb_vid = ifs[0].device_desc.idVendor;
+    usb_pid = ifs[0].device_desc.idProduct;
+    usb_ifnum = if_sess.inf.inf.interface_desc.bInterfaceNumber;
+    u16 ctrl_if = usb_ifnum ? usb_ifnum - 1 : 0;
+    u8 *lc = usb_ctrlbuf;
     memset(lc, 0, 0x40);
-    lc[0] = 0x00; lc[1] = 0xC2; lc[2] = 0x01; lc[3] = 0x00;  // 115200
-    lc[4] = 0; lc[5] = 0; lc[6] = 8;
+    lc[0] = 0x00; lc[1] = 0xC2; lc[2] = 0x01; lc[3] = 0x00;  // 115200 8N1
+    lc[6] = 8;
     u32 xfer = 0;
-    usbHsIfCtrlXfer(&if_sess, 0x21, 0x20, 0, ctrl_if, 7, lc, &xfer);
-    usbHsIfCtrlXfer(&if_sess, 0x21, 0x22, 0x03, ctrl_if, 0, lc, &xfer);
-    // slcan: close, 500 kbit/s, open LISTEN-ONLY (the adapter itself cannot transmit until armed)
-    static const char init[] = "\r\r\rC\rS6\rL\r";
-    usb_write(init, (int)sizeof(init) - 1);
-    plat_log("usb: opened %04X:%04X if=%d ctrl_if=%d (listen-only)", ifs[0].device_desc.idVendor, ifs[0].device_desc.idProduct,
-             if_sess.inf.inf.interface_desc.bInterfaceNumber, ctrl_if);
-    char lab[64];
-    snprintf(lab, sizeof(lab), "USB %04X:%04X slcan 500k", ifs[0].device_desc.idVendor, ifs[0].device_desc.idProduct);
-    set_label(lab);
+    Result r1 = usbHsIfCtrlXfer(&if_sess, 0x21, 0x20, 0, ctrl_if, 7, lc, &xfer);
+    Result r2 = usbHsIfCtrlXfer(&if_sess, 0x21, 0x22, 0x03, ctrl_if, 0, lc, &xfer);  // DTR | RTS
+    usb_kind = KIND_SLCAN;
     memset(&slp, 0, sizeof(slp));
+    usb_write("\r\r\r", 3);
+    slcan_open_cmd(1);
+    plat_log("usb: slcan %04X:%04X if=%d ctrl_if=%d linecoding=0x%X dtr=0x%X -> listen-only %dk", usb_vid, usb_pid, usb_ifnum, ctrl_if,
+             (unsigned)r1, (unsigned)r2, BR_KBPS[br_idx]);
     return true;
+}
+
+// ---- gs_usb (candleLight)
+typedef struct { u32 echo_id, can_id; u8 can_dlc, channel, flags, reserved; u8 data[8]; } __attribute__((packed)) GsFrame;
+
+static Result gs_ctrl_out(u8 req, u16 value, const void *data, u16 len) {
+    memcpy(usb_ctrlbuf, data, len);
+    u32 xfer = 0;
+    return usbHsIfCtrlXfer(&if_sess, 0x41, req, value, usb_ifnum, len, usb_ctrlbuf, &xfer);
+}
+
+static void gs_set_mode(int mode) {
+    u32 reset[2] = {0, 0};
+    gs_ctrl_out(2, 0, reset, 8);
+    // bit timing: find tq count 8..25 that divides the CAN clock exactly
+    u32 fclk = 48000000;
+    u32 xfer = 0;
+    memset(usb_ctrlbuf, 0, 64);
+    if (R_SUCCEEDED(usbHsIfCtrlXfer(&if_sess, 0xC1, 4, 0, usb_ifnum, 40, usb_ctrlbuf, &xfer)) && xfer >= 8) {
+        u32 v;
+        memcpy(&v, usb_ctrlbuf + 4, 4);
+        if (v) fclk = v;
+    }
+    u32 rate = (u32)BR_KBPS[br_idx] * 1000, tq = 16, brp = fclk / (rate * 16);
+    for (u32 q = 16; q >= 8; q--)
+        if (fclk % (rate * q) == 0) { tq = q; brp = fclk / (rate * q); break; }
+    u32 seg2 = tq / 8 > 1 ? tq / 8 : 2;  // ~87.5% sample point
+    u32 bt[5] = {1, tq - 1 - 1 - seg2, seg2, 1, brp ? brp : 1};  // prop, phase1, phase2, sjw, brp
+    gs_ctrl_out(1, 0, bt, 20);
+    u32 start[2] = {1, mode == 2 ? 0u : 1u};  // start, flags: LISTEN_ONLY
+    Result rc = gs_ctrl_out(2, 0, start, 8);
+    usb_cur_mode = mode;
+    plat_log("usb: gs_usb fclk=%u tq=%u brp=%u %dk mode=%s rc=0x%X", (unsigned)fclk, (unsigned)tq, (unsigned)brp, BR_KBPS[br_idx],
+             mode == 2 ? "normal" : "listen", (unsigned)rc);
+}
+
+static bool try_gsusb(void) {
+    UsbHsInterfaceFilter filter;
+    memset(&filter, 0, sizeof(filter));
+    filter.Flags = UsbHsInterfaceFilterFlags_idVendor | UsbHsInterfaceFilterFlags_idProduct;
+    filter.idVendor = 0x1D50;
+    filter.idProduct = 0x606F;
+    static UsbHsInterface ifs[4];
+    s32 total = 0;
+    if (R_FAILED(usbHsQueryAvailableInterfaces(&filter, ifs, sizeof(ifs), &total)) || total <= 0) return false;
+    if (R_FAILED(usbHsAcquireUsbIf(&if_sess, &ifs[0]))) return false;
+    have_if = true;
+    if (!open_bulk_eps()) { usb_close_dev(); return false; }
+    usb_vid = ifs[0].device_desc.idVendor;
+    usb_pid = ifs[0].device_desc.idProduct;
+    usb_ifnum = if_sess.inf.inf.interface_desc.bInterfaceNumber;
+    u32 fmt = 0x0000BEEF;
+    gs_ctrl_out(0, 1, &fmt, 4);  // HOST_FORMAT
+    usb_kind = KIND_GSUSB;
+    gs_set_mode(1);
+    return true;
+}
+
+static void gs_parse(const u8 *buf, u32 n) {
+    CanFrame tmp[64];
+    int got = 0;
+    for (u32 o = 0; o + sizeof(GsFrame) <= n && got < 64; o += sizeof(GsFrame)) {
+        GsFrame g;
+        memcpy(&g, buf + o, sizeof(g));
+        if (g.echo_id != 0xFFFFFFFFu) continue;           // echo of our own TX
+        if (g.can_id & 0x60000000u) continue;            // RTR / error frames
+        CanFrame f;
+        memset(&f, 0, sizeof(f));
+        f.ext = (g.can_id & 0x80000000u) ? 1 : 0;
+        f.id = g.can_id & (f.ext ? 0x1FFFFFFFu : 0x7FFu);
+        f.len = g.can_dlc > 8 ? 8 : g.can_dlc;
+        memcpy(f.data, g.data, 8);
+        tmp[got++] = f;
+    }
+    if (got) push_rx(tmp, got);
 }
 
 static bool usb_still_there(void) {
@@ -165,6 +284,11 @@ static bool usb_still_there(void) {
     s32 total = 0;
     if (R_FAILED(usbHsQueryAcquiredInterfaces(acq, sizeof(acq), &total))) return false;
     return total > 0;
+}
+
+static void usb_reopen(void) {
+    if (usb_kind == KIND_SLCAN) slcan_open_cmd(usb_cur_mode);
+    else if (usb_kind == KIND_GSUSB) gs_set_mode(usb_cur_mode);
 }
 
 static void usb_main(void *arg) {
@@ -176,30 +300,45 @@ static void usb_main(void *arg) {
         if (!have_if) {
             usb_state_v = USB_SEARCHING;
             set_label("USB: plug RAMN/CANable");
-            if (!usb_try_open()) {
+            if (!try_slcan() && !try_gsusb()) {
                 svcSleepThread(500000000ULL);
                 continue;
             }
             usb_state_v = USB_CONNECTED;
             posted = false;
             fails = 0;
+            ever_rx = false;
+            last_rx_tick = armGetSystemTick();
+            update_label();
         }
         // adapter mode change (listen-only <-> normal)
         int req = usb_mode_req;
         if (req) {
             usb_mode_req = 0;
-            const char *cmd = req == 2 ? "C\rS6\rO\r" : "C\rS6\rL\r";
-            usb_write(cmd, (int)strlen(cmd));
+            if (usb_kind == KIND_SLCAN) slcan_open_cmd(req);
+            else gs_set_mode(req);
             plat_log("usb: mode %s", req == 2 ? "NORMAL (TX armed)" : "LISTEN-ONLY");
         }
         // flush pending TX
         mutexLock(&usb_mtx);
         static char out[sizeof(txq)];
-        int n = txq_len;
+        static CanFrame gsout[256];
+        int n = txq_len, gn = gs_txq_n;
         if (n) memcpy(out, txq, (size_t)n);
+        if (gn) memcpy(gsout, gs_txq, sizeof(CanFrame) * (size_t)gn);
         txq_len = 0;
+        gs_txq_n = 0;
         mutexUnlock(&usb_mtx);
         if (n && !usb_write(out, n)) fails++;
+        for (int i = 0; i < gn; i++) {
+            GsFrame g;
+            memset(&g, 0, sizeof(g));
+            g.echo_id = gs_echo++ % 8;
+            g.can_id = gsout[i].id | (gsout[i].ext ? 0x80000000u : 0);
+            g.can_dlc = gsout[i].len;
+            memcpy(g.data, gsout[i].data, 8);
+            if (!usb_write(&g, sizeof(g))) fails++;
+        }
         // RX
         if (!posted) {
             u32 xid = 0;
@@ -215,17 +354,20 @@ static void usb_main(void *arg) {
                 memset(&rep, 0, sizeof(rep));
                 posted = false;
                 if (R_SUCCEEDED(usbHsEpGetXferReport(&ep_in, &rep, 1, &cnt)) && cnt > 0 && R_SUCCEEDED(rep.res)) {
-                    CanFrame tmp[128];
-                    int got = slcan_feed(&slp, usb_inbuf, (int)rep.transferredSize, tmp, 128);
-                    if (got) {
-                        mutexLock(&usb_mtx);
-                        for (int i = 0; i < got; i++) {
-                            int nx = (rxq_head + 1) % RXQ;
-                            if (nx == rxq_tail) break;  // full: drop
-                            rxq[rxq_head] = tmp[i];
-                            rxq_head = nx;
+                    if (usb_kind == KIND_SLCAN) {
+                        CanFrame tmp[128];
+                        int got = slcan_feed(&slp, usb_inbuf, (int)rep.transferredSize, tmp, 128);
+                        if (got) {
+                            push_rx(tmp, got);
+                            last_rx_tick = armGetSystemTick();
+                            if (!ever_rx) { ever_rx = true; update_label(); plat_log("usb: frames flowing at %dk", BR_KBPS[br_idx]); }
                         }
-                        mutexUnlock(&usb_mtx);
+                    } else {
+                        if (rep.transferredSize >= sizeof(GsFrame)) {
+                            gs_parse(usb_inbuf, rep.transferredSize);
+                            last_rx_tick = armGetSystemTick();
+                            if (!ever_rx) { ever_rx = true; update_label(); plat_log("usb: gs_usb frames flowing"); }
+                        }
                     }
                     fails = 0;
                 } else {
@@ -235,8 +377,21 @@ static void usb_main(void *arg) {
         } else {
             svcSleepThread(10000000ULL);
         }
-        // disconnect detection
         u64 nowt = armGetSystemTick();
+        // silent bus: never got a frame -> try the next bitrate (listen-only, so it cannot disturb the bus);
+        // got frames before -> the adapter probably closed the channel (RAMN does on USB overflow): reopen.
+        if (armTicksToNs(nowt - last_rx_tick) > 2500000000ULL) {
+            last_rx_tick = nowt;
+            if (!ever_rx && usb_cur_mode == 1) {
+                br_idx = (br_idx + 1) % 6;
+                plat_log("usb: no frames, trying %dk", BR_KBPS[br_idx]);
+            } else {
+                plat_log("usb: stream stopped, reopening at %dk", BR_KBPS[br_idx]);
+            }
+            usb_reopen();
+            update_label();
+        }
+        // disconnect detection
         if (fails > 20 || armTicksToNs(nowt - last_check) > 1000000000ULL) {
             last_check = nowt;
             if (fails > 20 || !usb_still_there()) {
@@ -254,6 +409,21 @@ static void usb_main(void *arg) {
 
 void plat_usb_set_tx(bool enable) { usb_mode_req = enable ? 2 : 1; }
 
+bool plat_usb_raw(const char *cmd) {
+    if (usb_state_v != USB_CONNECTED || usb_kind != KIND_SLCAN) return false;
+    int n = (int)strlen(cmd);
+    bool ok = false;
+    mutexLock(&usb_mtx);
+    if (txq_len + n < (int)sizeof(txq)) {
+        memcpy(txq + txq_len, cmd, (size_t)n);
+        txq_len += n;
+        ok = true;
+    }
+    mutexUnlock(&usb_mtx);
+    plat_log("usb: raw cmd %s", cmd[0] == 'y' || cmd[0] == 'Y' ? cmd : "(other)");
+    return ok;
+}
+
 static void usb_start(void) {
     mutexInit(&usb_mtx);
     if (g_safe_mode) {
@@ -263,9 +433,10 @@ static void usb_start(void) {
     }
     usb_inbuf = memalign(0x1000, 0x1000);
     usb_outbuf = memalign(0x1000, 0x1000);
+    usb_ctrlbuf = memalign(0x1000, 0x1000);
     Result rc = usbHsInitialize();
     plat_log("usbHsInitialize rc=0x%X", (unsigned)rc);
-    if (R_FAILED(rc) || !usb_inbuf || !usb_outbuf) {
+    if (R_FAILED(rc) || !usb_inbuf || !usb_outbuf || !usb_ctrlbuf) {
         usb_state_v = USB_ERROR;
         snprintf(usb_label_s, sizeof(usb_label_s), "USB host unavailable (0x%X)", (unsigned)rc);
         return;
@@ -312,14 +483,18 @@ int plat_usb_poll(CanFrame *out, int max) {
 
 bool plat_usb_send(const CanFrame *f) {
     if (usb_state_v != USB_CONNECTED) return false;
-    char line[48];
-    int n = slcan_encode(f, line);
     bool ok = false;
     mutexLock(&usb_mtx);
-    if (txq_len + n < (int)sizeof(txq)) {
-        memcpy(txq + txq_len, line, (size_t)n);
-        txq_len += n;
-        ok = true;
+    if (usb_kind == KIND_GSUSB) {
+        if (gs_txq_n < 256) { gs_txq[gs_txq_n++] = *f; ok = true; }
+    } else {
+        char line[48];
+        int n = slcan_encode(f, line);
+        if (txq_len + n < (int)sizeof(txq)) {
+            memcpy(txq + txq_len, line, (size_t)n);
+            txq_len += n;
+            ok = true;
+        }
     }
     mutexUnlock(&usb_mtx);
     return ok;

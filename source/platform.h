@@ -18,6 +18,8 @@ int plat_usb_poll(CanFrame *out, int max);  // frames received since last call
 bool plat_usb_send(const CanFrame *f);
 // Bus-level safety: false = adapter opened listen-only ("L"), true = normal mode ("O") so we may transmit.
 void plat_usb_set_tx(bool enable);
+// Raw adapter command (slcan only), e.g. RAMN "yC0\r" = power off ECU C. Returns false if unsupported.
+bool plat_usb_raw(const char *cmd);
 
 // ---- Joy-Con NFC reader
 enum { NFC_OFF = 0, NFC_ERROR = 1, NFC_SEARCHING = 2, NFC_TAG = 3 };

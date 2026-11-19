@@ -15,6 +15,16 @@ static char usb_label[64] = "USB: none";
 static int usb_tx_mode;  // 0 listen-only, 1 normal
 int plat_usb_state(void) { return usb_state_v; }
 const char *plat_usb_label(void) { return usb_label; }
+static bool pwr[3] = {true, true, true};   // ECU B, C, D
+static double reboot_until[3];
+static char pending[8192];
+static int pending_n;
+bool plat_usb_raw(const char *cmd) {
+    fprintf(stderr, "[usb] raw %s\n", cmd);
+    if (cmd[0] == 'y' && cmd[1] >= 'B' && cmd[1] <= 'D') pwr[cmd[1] - 'B'] = cmd[2] == '1';
+    if (cmd[0] == 'Y') for (int i = 0; i < 3; i++) pwr[i] = cmd[1] == '1';
+    return true;
+}
 void plat_usb_set_tx(bool en) { usb_tx_mode = en; fprintf(stderr, "[usb] adapter mode %s\n", en ? "O (normal)" : "L (listen-only)"); }
 void plat_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); fprintf(stderr, "[log] "); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap); }
 bool plat_safe_mode(void) { return false; }
@@ -44,6 +54,14 @@ static int emit(char *buf, uint32_t id, uint16_t sig, int sig8) {
     return n;
 }
 static SlcanParser P;
+static bool ecu_up(int e) { return pwr[e] && T >= reboot_until[e]; }
+static void queue_raw(uint32_t id, const uint8_t *d) {
+    pending_n += sprintf(pending + pending_n, "t%03X8", id);
+    for (int i = 0; i < 8; i++) pending_n += sprintf(pending + pending_n, "%02X", d[i]);
+    pending[pending_n++] = '\r';
+}
+// ISO-TP multi-frame response state
+static uint8_t mf_buf[64]; static int mf_len, mf_pos, mf_ecu = -1, mf_sn;
 int plat_usb_poll(CanFrame *out, int max) {
     static double last_fast = 0, last_slow = 0;
     if (usb_state_v != USB_CONNECTED) return 0;
@@ -51,18 +69,19 @@ int plat_usb_poll(CanFrame *out, int max) {
     int n = 0;
     while (last_fast + 0.01 <= T && n < 3500) {
         last_fast += 0.01;
-        n += emit(buf + n, 0x024, (uint16_t)(fmax(0, 900 * sin(last_fast * 0.9))), 0);          // brake
-        n += emit(buf + n, 0x039, (uint16_t)(2048 + 2000 * sin(last_fast * 1.3)), 0);           // accel
-        n += emit(buf + n, 0x062, (uint16_t)(2047 + 1500 * sin(last_fast * 0.5)), 0);           // steering
+        if (ecu_up(1)) n += emit(buf + n, 0x024, (uint16_t)(fmax(0, 900 * sin(last_fast * 0.9))), 0);          // brake
+        if (ecu_up(1)) n += emit(buf + n, 0x039, (uint16_t)(2048 + 2000 * sin(last_fast * 1.3)), 0);           // accel
+        if (ecu_up(0)) n += emit(buf + n, 0x062, (uint16_t)(2047 + 1500 * sin(last_fast * 0.5)), 0);           // steering
         n += emit(buf + n, 0x043, (uint16_t)(1200 + 800 * sin(last_fast)), 0);                  // rpm status
     }
     while (last_slow + 0.1 <= T && n < 3500) {
         last_slow += 0.1;
-        n += emit(buf + n, 0x077, 3, 1);                                                    // gear 3
-        n += emit(buf + n, 0x150, 0x0003, 0);                                               // light switch: LOW
-        n += emit(buf + n, 0x1A7, 0x0000, 0);                                               // no turn signal
-        n += emit(buf + n, 0x1B8, 3, 1);                                                    // key IGN
-        n += emit(buf + n, 0x1D3, 0, 1);                                                    // park brake down
+        if (ecu_up(1)) n += emit(buf + n, 0x077, 3, 1);                                     // gear 3
+        if (ecu_up(0)) n += emit(buf + n, 0x150, 0x0003, 0);                                // light switch: LOW
+        if (ecu_up(1)) n += emit(buf + n, 0x1A7, 0x0000, 0);                                // no turn signal
+        if (ecu_up(1)) n += emit(buf + n, 0x098, 0, 1);                                     // horn button
+        if (ecu_up(2)) n += emit(buf + n, 0x1B8, 3, 1);                                     // key IGN
+        if (ecu_up(0)) n += emit(buf + n, 0x1D3, 0, 1);                                     // park brake down
         // ECU D: LEDs from what it received last (forged frames win while attack runs)
         uint16_t tv = (T - last_forged_turn < 0.2) ? turn_val : 0;
         uint16_t lv = (T - last_forged_lights < 0.2) ? lights_val : 0x0003;
@@ -77,8 +96,9 @@ int plat_usb_poll(CanFrame *out, int max) {
         bool blink = fmod(T, 1.0) >= 0.5;
         if ((tv & 0xFF00) && blink) led |= 0x40;
         if ((tv & 0x00FF) && blink) led |= 0x80;
-        n += emit(buf + n, 0x1BB, led, 1);
+        if (ecu_up(2)) n += emit(buf + n, 0x1BB, led, 1);
     }
+    if (pending_n && n + pending_n < (int)sizeof(buf)) { memcpy(buf + n, pending, (size_t)pending_n); n += pending_n; pending_n = 0; }
     return slcan_feed(&P, (const uint8_t *)buf, n, out, max);
 }
 static int sent;
@@ -89,8 +109,40 @@ bool plat_usb_send(const CanFrame *f) {
     sent++;
     if (sent <= 2) fprintf(stderr, "TX %s\n", b);
     // verify the forged CRC like an IDS would
-    if (f->len == 8 && crc32b(f->data, 4) != ((uint32_t)f->data[4] | f->data[5] << 8 | f->data[6] << 16 | (uint32_t)f->data[7] << 24))
+    if (f->len == 8 && !(f->id >= 0x7E0 && f->id <= 0x7EF) && crc32b(f->data, 4) != ((uint32_t)f->data[4] | f->data[5] << 8 | f->data[6] << 16 | (uint32_t)f->data[7] << 24))
         fprintf(stderr, "!! bad forged CRC on %03X\n", f->id);
+    if (f->id >= 0x7E1 && f->id <= 0x7E3) {  // UDS to ECU B/C/D
+        int e = f->id - 0x7E1;
+        uint32_t rid = 0x7E9 + e;
+        uint8_t r[8] = {0};
+        if (!ecu_up(e)) return true;
+        if ((f->data[0] >> 4) == 3 && mf_ecu == e) {  // flow control -> send consecutive frames
+            while (mf_pos < mf_len) {
+                memset(r, 0, 8);
+                r[0] = 0x20 | (mf_sn++ & 15);
+                for (int i = 1; i < 8 && mf_pos < mf_len; i++) r[i] = mf_buf[mf_pos++];
+                queue_raw(rid, r);
+            }
+            mf_ecu = -1;
+            return true;
+        }
+        uint8_t sid = f->data[1];
+        if (sid == 0x3E) { r[0] = 2; r[1] = 0x7E; r[2] = 0; queue_raw(rid, r); }
+        else if (sid == 0x11) { r[0] = 2; r[1] = 0x51; r[2] = 1; queue_raw(rid, r); reboot_until[e] = T + 0.8; }
+        else if (sid == 0x22) {
+            uint16_t did = f->data[2] << 8 | f->data[3];
+            const char *val = did == 0xF190 ? "RAMNVIN0123456789AB" : did == 0xF184 ? "Nov  6 2026 16:06:58" : NULL;
+            if (!val) { r[0] = 3; r[1] = 0x7F; r[2] = 0x22; r[3] = 0x31; queue_raw(rid, r); return true; }
+            mf_len = 0;
+            mf_buf[mf_len++] = 0x62; mf_buf[mf_len++] = f->data[2]; mf_buf[mf_len++] = f->data[3];
+            for (const char *c = val; *c; c++) mf_buf[mf_len++] = (uint8_t)*c;
+            r[0] = 0x10 | (mf_len >> 8); r[1] = mf_len & 255;
+            for (int i = 0; i < 6; i++) r[2 + i] = mf_buf[i];
+            mf_pos = 6; mf_sn = 1; mf_ecu = e;
+            queue_raw(rid, r);
+        } else { r[0] = 3; r[1] = 0x7F; r[2] = sid; r[3] = 0x11; queue_raw(rid, r); }
+        return true;
+    }
     if (f->id == 0x1A7) { turn_val = f->data[0] | f->data[1] << 8; last_forged_turn = T; }
     if (f->id == 0x150) { lights_val = f->data[0] << 8 | f->data[1]; last_forged_lights = T; }
     if (f->id == 0x1D3) { pbrake_val = f->data[0]; last_forged_pb = T; }
@@ -181,19 +233,40 @@ int main(void) {
         {42.3, B_B, 0.0f, 1, NULL}, {42.4, 0, 0.0f, 1, NULL},           // check engine
         {43.6, 0, 0.0f, 1, "09_ramn_hazards_check_engine"},
         {44.2, 0, 0.0f, 1, "10_ramn_hazards_blink_off"},
-        {44.5, B_R, 0.0f, 1, NULL}, {44.6, B_R, 0.0f, 1, NULL}, {44.7, 0, 0.0f, 1, NULL},
+        {44.5, B_R, 0.0f, 1, NULL}, {44.6, 0, 0.0f, 1, NULL}, {44.7, B_R, 0.0f, 1, NULL}, {44.8, 0, 0.0f, 1, NULL},
         {45.0, 0, 0.0f, 1, "11_ramn_ids"},
-        {45.2, 0, 0.0f, 0, NULL},
-        {46.0, 0, 0.0f, 0, "12_unplugged"},
-        {46.1, 0, 0.0f, 0, NULL},
+        {45.2, B_R, 0.0f, 1, NULL}, {45.3, 0, 0.0f, 1, NULL},               // -> ECU tab
+        {45.4, B_A, 0.0f, 1, NULL}, {45.5, 0, 0.0f, 1, NULL},               // ping B
+        {45.8, B_Y, 0.0f, 1, NULL}, {45.9, 0, 0.0f, 1, NULL},               // VIN + date (multi-frame)
+        {46.5, B_DOWN, 0.0f, 1, NULL}, {46.6, 0, 0.0f, 1, NULL},            // select C
+        {46.7, B_A, 0.0f, 1, NULL}, {46.8, 0, 0.0f, 1, NULL},
+        {47.0, B_DOWN, 0.0f, 1, NULL}, {47.1, 0, 0.0f, 1, NULL},            // select D
+        {47.2, B_X, 0.0f, 1, NULL}, {47.3, 0, 0.0f, 1, NULL},               // reset D -> silent
+        {49.0, 0, 0.0f, 1, "13_ecu_uds"},
+        {49.2, B_B, 0.0f, 1, NULL}, {49.3, 0, 0.7f, 1, NULL},               // START TAKEOVER, gas
+        {52.0, B_ZL, 0.4f, 1, NULL},                                     // gas + brake
+        {53.0, 0, 0.9f, 1, "14_takeover"},
+        {53.2, 0x80000000u | 0, 0.9f, 1, NULL}, {53.3, 0, 0.9f, 1, NULL},   // touch tab 0 (CLUSTER)
+        {55.5, 0, 0.9f, 1, "15_takeover_dash"},
+        {55.6, 0x80000000u | 3, 0.0f, 1, NULL}, {55.7, 0, 0.0f, 1, NULL},   // touch tab 3 (ECU)
+        {56.3, B_B, 0.0f, 1, NULL}, {56.4, 0, 0.0f, 1, NULL},               // stop takeover
+        {56.6, 0x80000000u | 2, 0.0f, 1, NULL}, {56.7, 0, 0.0f, 1, NULL},   // touch tab 2 (IDS)
+        {58.5, 0, 0.0f, 1, "16_after_takeover_ids"},
+        {58.7, 0, 0.0f, 0, NULL},
+        {59.5, 0, 0.0f, 0, "12_unplugged"},
+        {59.6, 0, 0.0f, 0, NULL},
     };
     int ns = sizeof S / sizeof S[0], si = 0, last_si = -1;
-    for (T = 0; T < 46.2; T += 1.0 / 60) {
+    for (T = 0; T < 59.7; T += 1.0 / 60) {
         while (si + 1 < ns && S[si + 1].at <= T) si++;
         usb_state_v = S[si].usb ? USB_CONNECTED : USB_SEARCHING;
         snprintf(usb_label, sizeof usb_label, S[si].usb ? "USB 0483:5740 slcan 500k" : "USB: none");
-        in.held = S[si].held; in.down = in.held & ~prev; in.up = prev & ~in.held; prev = in.held;
-        in.stick_y = S[si].stick; in.touching = false;
+        uint32_t hb = S[si].held;
+        in.touching = false;
+        if (hb & 0x80000000u) { in.touching = true; in.tx = 172 + (int)(hb & 15) * 106 + 51; in.ty = 28; hb = 0; }
+        in.held = hb; in.down = in.held & ~prev; in.up = prev & ~in.held; prev = in.held;
+        in.stick_y = S[si].stick;
+        in.rstick_x = (float)sin(T * 1.5);
         if (!app_frame(&c, &in, T)) { printf("quit at %.2f\n", T); break; }
         if (S[si].shot && si != last_si) save(S[si].shot);
         last_si = si;

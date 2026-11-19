@@ -185,6 +185,7 @@ typedef struct {
     bool ctr_have;
     uint32_t crc_ok, crc_bad;
     Rate ctr_err, crc_err;
+    double last_ext;  // last frame NOT sent by us (is the real ECU still talking?)
 } IdInfo;
 
 static IdInfo ids[MAXIDS];
@@ -197,6 +198,7 @@ static Rate mac_fail;
 static uint32_t mac_fail_total;
 // real bus
 static bool ramn_mode;
+static bool own_tx;            // true while ingesting a frame we transmitted ourselves
 static int nids;
 static Rate rx_rate, ctr_rate;
 static int ctr_last = -1;
@@ -218,6 +220,7 @@ static void bus_reset(void) {
 }
 
 static bool src_is_sim(void);
+static void uds_on_frame(const CanFrame *f, double t);
 static void ingest(const CanFrame *f, double t) {
     IdInfo *e = find_id(f->id);
     if (!e) {
@@ -240,6 +243,7 @@ static void ingest(const CanFrame *f, double t) {
     e->len = (uint8_t)len;
     e->count++;
     e->last = t;
+    if (!own_tx) e->last_ext = t;
     rate_add(&e->rate, t);
     rate_add(&rx_rate, t);
     if (src_is_sim() && f->id == ID_SPEED && len >= 3) {
@@ -260,7 +264,8 @@ static void ingest(const CanFrame *f, double t) {
             mac_fail_total++;
         }
     }
-    if (!src_is_sim() && len == 8) {
+    if (!src_is_sim() && !own_tx && f->id >= 0x7E9 && f->id <= 0x7EB) uds_on_frame(f, t);
+    if (!src_is_sim() && len == 8 && !(f->id >= 0x7E0 && f->id <= 0x7EF)) {
         // RAMN framing: [signal][counter BE][CRC32 LE of bytes 0-3]
         uint32_t crc = crc32_buf(f->data, 4);
         uint32_t got = (uint32_t)f->data[4] | (uint32_t)f->data[5] << 8 | (uint32_t)f->data[6] << 16 | (uint32_t)f->data[7] << 24;
@@ -288,11 +293,14 @@ static void ingest(const CanFrame *f, double t) {
 
 // ----------------------------------------------------------------- app state
 enum { SRC_SIM, SRC_USB };
-enum { TAB_CLUSTER, TAB_SNIFF, TAB_IDS, TAB_NFC, TAB_IR, NTABS };
-static const char *TAB_NAMES[NTABS] = {"CLUSTER", "SNIFFER", "IDS", "NFC", "IR CAM"};
+enum { TAB_CLUSTER, TAB_SNIFF, TAB_IDS, TAB_ECU, TAB_NFC, TAB_IR, NTABS };
+static const char *TAB_NAMES[NTABS] = {"CLUSTER", "SNIFFER", "IDS", "ECU", "NFC", "IR CAM"};
 
 static int src = SRC_SIM;
 static bool src_is_sim(void) { return src == SRC_SIM; }
+static int ecu_sel;
+static void ecu_press(uint32_t b, double t);
+static void tko_release(uint32_t b);
 static int tab = TAB_CLUSTER;
 static bool tx_armed = true;
 static bool show_help;
@@ -452,7 +460,9 @@ static void emit_tx(const CanFrame *f, double t) {
     } else if (tx_armed) {
         if (plat_usb_send(f)) {
             atk_sent++;
+            own_tx = true;
             ingest(f, t);  // we are a node on the bus: our frames are part of the traffic the IDS taps
+            own_tx = false;
         }
     }
 }
@@ -620,7 +630,10 @@ static void ids_eval(double t) {
     for (int i = 0; i < nids; i++) {
         int r = rate_get(&ids[i].rate, t);
         if (ids[i].base < 0) {
-            if (r > 0) {
+            if (r > 0 && ids[i].id >= 0x7DF && ids[i].id <= 0x7EF) {
+                snprintf(buf, sizeof(buf), "UDS diagnostic traffic on 0x%03X", (unsigned)ids[i].id);
+                ids_alert(0x10000000 | ids[i].id, SEV_INFO, buf, t);
+            } else if (r > 0) {
                 snprintf(buf, sizeof(buf), "UNKNOWN ID 0x%03X appeared (%d Hz)", (unsigned)ids[i].id, r);
                 ids_alert(0x10000000 | ids[i].id, SEV_WARN, buf, t);
             }
@@ -648,6 +661,10 @@ static void ids_eval(double t) {
         if (kr > 2) {
             snprintf(buf, sizeof(buf), "CRC32 FAIL 0x%03X: %d/s -> corrupted/fuzzed", (unsigned)ids[i].id, kr);
             ids_alert(0x60000000 | ids[i].id, SEV_CRIT, buf, t);
+        }
+        if (ids[i].base >= 5 && t - ids[i].last > 1.0) {
+            snprintf(buf, sizeof(buf), "0x%03X SILENT %.0fs: ECU off / bus-off / reset?", (unsigned)ids[i].id, t - ids[i].last);
+            ids_alert(0x70000000 | ids[i].id, SEV_WARN, buf, t);
         }
     }
 }
@@ -802,7 +819,7 @@ static void gauge_draw(Canvas *c, Gauge *g, float value, bool alive) {
 }
 
 // ---------------------------------------------------------------- touch map
-enum { HT_TAB, HT_QUIT, HT_HELP, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE };
+enum { HT_TAB, HT_QUIT, HT_HELP, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE, HT_ECU };
 typedef struct { Rect r; int type; uint32_t a, b; } Hit;
 static Hit hits[96];
 static int nhits;
@@ -952,6 +969,8 @@ static void press(uint32_t b, double t) {
     } else if (tab == TAB_IDS) {
         if (b == B_A) { ids_reset(t); toast(t, "Re-learning baseline"); }
         else if (b == B_B) nalerts = 0;
+    } else if (tab == TAB_ECU) {
+        ecu_press(b, t);
     } else if (tab == TAB_NFC) {
         if (b == B_B) n_nfc_hist = 0;
     } else if (tab == TAB_IR) {
@@ -961,6 +980,7 @@ static void press(uint32_t b, double t) {
 
 static void release(uint32_t b) {
     held_bits &= ~b;
+    tko_release(b);
     if (b == B_ZR) { atk_hold[ATK_SPEED] = false; atk_hold[ATK_OMAX] = false; }
     if (b == B_ZL) { atk_hold[ATK_RPM] = false; atk_hold[ATK_OMIN] = false; }
     if (b == B_PLUS) plus_t = -1;
@@ -981,6 +1001,10 @@ static void tap(int x, int y, double t) {
             case HT_ROW: sel_id = h->a; have_sel = true; break;
             case HT_BYTE: sel_id = h->a; have_sel = true; byte_cur = (int)h->b; break;
             case HT_IRMODE: ir_thermal = !ir_thermal; break;
+            case HT_ECU:
+                ecu_sel = (int)h->a;
+                if (h->b) { press(h->b, t); release(h->b); }
+                break;
         }
         return;
     }
@@ -1007,6 +1031,266 @@ static void attract(double t) {
     }
 }
 
+
+// ===================================================== ECU tools (real RAMN)
+// UDS over ISO-TP (ECU B/C/D: request 0x7E1-0x7E3, response 0x7E9-0x7EB), ECU power control
+// through RAMN's USB command set (yX0/yX1/Y1), and the Joy-Con takeover (masquerade of ECU B + C).
+typedef struct { char s[72]; uint32_t col; } LogLine;
+static LogLine ulog[14];
+static int nulog;
+static void ulog_add(uint32_t col, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void ulog_add(uint32_t col, const char *fmt, ...) {
+    memmove(&ulog[1], &ulog[0], sizeof(LogLine) * 13);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(ulog[0].s, sizeof(ulog[0].s), fmt, ap);
+    va_end(ap);
+    ulog[0].col = col;
+    if (nulog < 14) nulog++;
+}
+
+static const char ECU_LETTER[3] = {'B', 'C', 'D'};
+static const char *ECU_ROLE[3] = {"chassis: steering, park brake, lights", "powertrain: pedals, gear, horn, turn",
+                                  "body: engine key, LEDs"};
+static bool ecu_power[3] = {true, true, true};
+static double ecu_alive_t[3] = {-100, -100, -100};
+static char ecu_info[3][64];
+
+typedef struct { int ecu; uint8_t p[7]; int n; } UdsReq;
+static UdsReq uq[8];
+static int uq_n;
+static bool uds_wait;
+static int uds_ecu;
+static double uds_sent_t;
+static uint8_t uds_buf[256];
+static int uds_need, uds_got;
+static uint8_t uds_req_sid;
+static uint16_t uds_req_did;
+
+static void uds_queue(int ecu, const uint8_t *p, int n) {
+    if (uq_n < 8) { uq[uq_n].ecu = ecu; memcpy(uq[uq_n].p, p, (size_t)n); uq[uq_n].n = n; uq_n++; }
+}
+
+static const char *nrc_name(uint8_t c) {
+    switch (c) {
+        case 0x10: return "generalReject";
+        case 0x11: return "serviceNotSupported";
+        case 0x12: return "subFunctionNotSupported";
+        case 0x13: return "incorrectLength";
+        case 0x22: return "conditionsNotCorrect";
+        case 0x31: return "requestOutOfRange";
+        case 0x33: return "securityAccessDenied";
+        case 0x35: return "invalidKey";
+        case 0x78: return "responsePending";
+        case 0x7E: return "subFnNotInSession";
+        case 0x7F: return "serviceNotInSession";
+    }
+    return "?";
+}
+
+static void uds_complete(double t) {
+    int e = uds_ecu;
+    uint8_t *r = uds_buf;
+    int n = uds_got < uds_need ? uds_got : uds_need;
+    uds_wait = false;
+    if (n < 1) return;
+    if (r[0] == 0x7F && n >= 3) {
+        if (r[2] == 0x78) { uds_wait = true; uds_sent_t = t; return; }  // pending: keep waiting
+        ulog_add(AMBER, "<- %c  NRC 0x%02X %s (SID %02X)", ECU_LETTER[e], r[2], nrc_name(r[2]), r[1]);
+        ecu_alive_t[e] = t;
+        return;
+    }
+    ecu_alive_t[e] = t;
+    if (r[0] == 0x7E) ulog_add(GREEN, "<- %c  TesterPresent OK: ECU alive", ECU_LETTER[e]);
+    else if (r[0] == 0x50) ulog_add(GREEN, "<- %c  Session 0x%02X active", ECU_LETTER[e], n > 1 ? r[1] : 0);
+    else if (r[0] == 0x51) {
+        ulog_add(RED, "<- %c  ECUReset accepted: rebooting!", ECU_LETTER[e]);
+        plat_rumble(0.7f, 200);
+    } else if (r[0] == 0x62 && n >= 3) {
+        uint16_t did = (uint16_t)(r[1] << 8 | r[2]);
+        char asc[48];
+        int k = 0;
+        for (int i = 3; i < n && k < 40; i++) asc[k++] = (r[i] >= 32 && r[i] < 127) ? (char)r[i] : '.';
+        asc[k] = 0;
+        ulog_add(GREEN, "<- %c  DID %04X: %s", ECU_LETTER[e], did, asc);
+        if (did == 0xF190) snprintf(ecu_info[e], sizeof(ecu_info[e]), "VIN %s", asc);
+        else if (did == 0xF184 && !ecu_info[e][0]) snprintf(ecu_info[e], sizeof(ecu_info[e]), "built %s", asc);
+    } else {
+        char hx[64];
+        int k = 0;
+        for (int i = 0; i < n && i < 12; i++) k += sprintf(hx + k, "%02X ", r[i]);
+        ulog_add(FG, "<- %c  %s", ECU_LETTER[e], hx);
+    }
+}
+
+static void uds_on_frame(const CanFrame *f, double t) {
+    if (!uds_wait || f->id != 0x7E9u + (uint32_t)uds_ecu || f->len < 1) return;
+    const uint8_t *d = f->data;
+    int pci = d[0] >> 4;
+    if (pci == 0) {  // single frame
+        uds_need = d[0] & 15;
+        uds_got = 0;
+        for (int i = 1; i < f->len && uds_got < uds_need; i++) uds_buf[uds_got++] = d[i];
+        uds_complete(t);
+    } else if (pci == 1 && f->len >= 2) {  // first frame -> send flow control
+        uds_need = ((d[0] & 15) << 8) | d[1];
+        if (uds_need > (int)sizeof(uds_buf)) uds_need = sizeof(uds_buf);
+        uds_got = 0;
+        for (int i = 2; i < f->len && uds_got < uds_need; i++) uds_buf[uds_got++] = d[i];
+        CanFrame fc;
+        memset(&fc, 0, sizeof(fc));
+        fc.id = 0x7E1u + (uint32_t)uds_ecu;
+        fc.len = 8;
+        fc.data[0] = 0x30;  // continue to send, no block limit, STmin 0
+        emit_tx(&fc, t);
+    } else if (pci == 2) {  // consecutive frame
+        for (int i = 1; i < f->len && uds_got < uds_need; i++) uds_buf[uds_got++] = d[i];
+        if (uds_got >= uds_need) uds_complete(t);
+    }
+}
+
+static void uds_tick(double t) {
+    if (uds_wait && t - uds_sent_t > 1.2) {
+        ulog_add(DIM, "<- %c  no reply (powered off? not a UDS ECU?)", ECU_LETTER[uds_ecu]);
+        uds_wait = false;
+    }
+    if (uds_wait || uq_n == 0 || src != SRC_USB || !tx_armed) return;
+    UdsReq q = uq[0];
+    memmove(&uq[0], &uq[1], sizeof(UdsReq) * (size_t)(uq_n - 1));
+    uq_n--;
+    CanFrame f;
+    memset(&f, 0, sizeof(f));
+    f.id = 0x7E1u + (uint32_t)q.ecu;
+    f.len = 8;
+    f.data[0] = (uint8_t)q.n;
+    memcpy(f.data + 1, q.p, (size_t)q.n);
+    char hx[40];
+    int k = 0;
+    for (int i = 0; i <= q.n; i++) k += sprintf(hx + k, "%02X ", f.data[i]);
+    ulog_add(CYAN, "-> %c  %03X  %s", ECU_LETTER[q.ecu], (unsigned)f.id, hx);
+    uds_ecu = q.ecu;
+    uds_req_sid = q.p[0];
+    uds_req_did = q.n >= 3 ? (uint16_t)(q.p[1] << 8 | q.p[2]) : 0;
+    uds_wait = true;
+    uds_sent_t = t;
+    uds_need = uds_got = 0;
+    emit_tx(&f, t);
+}
+
+static bool ecu_power_set(int e, bool on, double t) {
+    char cmd[8];
+    snprintf(cmd, sizeof(cmd), "y%c%d\r", ECU_LETTER[e], on ? 1 : 0);
+    if (!plat_usb_raw(cmd)) { toast(t, "ECU power control needs RAMN's USB serial (slcan)"); return false; }
+    ecu_power[e] = on;
+    ulog_add(on ? GREEN : RED, "-> USB  y%c%d  power %s ECU %c", ECU_LETTER[e], on, on ? "ON" : "OFF", ECU_LETTER[e]);
+    return true;
+}
+
+// ---- Joy-Con takeover: impersonate every message of ECU B and C at their real periods
+static const uint32_t TKO_ID[8] = {R_CTL_STEER, R_CTL_PBRAKE, R_CMD_LIGHTS, R_CTL_BRAKE, R_CTL_ACCEL, R_CTL_SHIFT, R_CMD_HORN, R_CMD_TURN};
+static const double TKO_P[8] = {0.01, 0.1, 0.1, 0.01, 0.01, 0.1, 0.1, 0.1};
+static bool tko_on;
+static double tko_t0, tko_last[8];
+static uint16_t tko_accel, tko_brake, tko_steer = 0x7FF;
+static int tko_gear = 1, tko_blink;  // blink: 0 off, 1 left, 2 right, 3 hazard
+static bool tko_horn;
+static int tko_alerts0;
+
+static void tko_start(double t) {
+    if (!can_tx(t)) return;
+    if (!ecu_power_set(0, false, t) || !ecu_power_set(1, false, t)) return;
+    tko_on = true;
+    tko_t0 = t;
+    for (int i = 0; i < 8; i++) tko_last[i] = t;
+    bool ok;
+    IdInfo *e = find_id(R_CTL_SHIFT);
+    (void)ok;
+    if (e && e->len >= 1 && e->data[0] >= 1 && e->data[0] <= 6) tko_gear = e->data[0];
+    tko_alerts0 = nalerts;
+    toast(t, "TAKEOVER: ECU B + C powered off, your Joy-Cons ARE the steering wheel and pedals now");
+    plat_rumble(0.9f, 300);
+}
+
+static void tko_stop(double t) {
+    if (!tko_on) return;
+    tko_on = false;
+    ecu_power_set(0, true, t);
+    ecu_power_set(1, true, t);
+    toast(t, "Takeover ended - ECU B + C powered back on (watch the IDS: their counters restart at 0)");
+    plat_rumble(0.5f, 150);
+}
+
+static void tko_tick(double t) {
+    if (!tko_on) return;
+    if (src != SRC_USB || !tx_armed) { tko_on = false; return; }
+    for (int i = 0; i < 8; i++) {
+        if (t - tko_last[i] > 0.3) tko_last[i] = t - TKO_P[i];
+        int guard = 0;
+        while (t - tko_last[i] >= TKO_P[i] && guard++ < 5) {
+            tko_last[i] += TKO_P[i];
+            uint8_t v[2] = {0, 0};
+            int nb = 2;
+            switch (TKO_ID[i]) {
+                case R_CTL_STEER: v[0] = tko_steer >> 8; v[1] = tko_steer & 255; break;
+                case R_CTL_BRAKE: v[0] = tko_brake >> 8; v[1] = tko_brake & 255; break;
+                case R_CTL_ACCEL: v[0] = tko_accel >> 8; v[1] = tko_accel & 255; break;
+                case R_CTL_SHIFT: v[0] = (uint8_t)tko_gear; v[1] = 1; break;  // joystick released
+                case R_CMD_HORN: v[0] = tko_horn ? 1 : 0; nb = 1; break;
+                case R_CMD_TURN: v[0] = (tko_blink & 2) ? 1 : 0; v[1] = (tko_blink & 1) ? 1 : 0; break;  // b0 right, b1 left
+                case R_CTL_PBRAKE: v[0] = 0; nb = 1; break;
+                case R_CMD_LIGHTS: {
+                    IdInfo *e = find_id(R_CMD_LIGHTS);
+                    v[0] = 0;
+                    v[1] = (e && e->len >= 2) ? e->data[1] : 1;
+                } break;
+            }
+            CanFrame f;
+            ramn_forge(TKO_ID[i], 0, v, nb, &f);
+            emit_tx(&f, t);
+        }
+    }
+}
+
+static void ecu_press(uint32_t b, double t) {
+    if (src != SRC_USB) { toast(t, "Plug in a RAMN: the ECU tools talk to real ECUs over UDS"); return; }
+    if (tko_on) {
+        if (b == B_B) tko_stop(t);
+        else if (b == B_UP) { if (tko_gear < 6) tko_gear++; }
+        else if (b == B_DOWN) { if (tko_gear > 1) tko_gear--; }
+        else if (b == B_LEFT) tko_blink = tko_blink == 1 ? 0 : 1;
+        else if (b == B_RIGHT) tko_blink = tko_blink == 2 ? 0 : 2;
+        else if (b == B_Y) tko_blink = tko_blink == 3 ? 0 : 3;
+        else if (b == B_A) tko_horn = true;
+        return;
+    }
+    if (b == B_UP) { ecu_sel = (ecu_sel + 2) % 3; return; }
+    if (b == B_DOWN) { ecu_sel = (ecu_sel + 1) % 3; return; }
+    if (b != B_A && b != B_Y && b != B_X && b != B_ZR && b != B_B && b != B_ZL) return;
+    if (!can_tx(t)) return;
+    if (b == B_A) { uint8_t p[2] = {0x3E, 0x00}; uds_queue(ecu_sel, p, 2); }
+    else if (b == B_Y) {
+        uint8_t p1[3] = {0x22, 0xF1, 0x90}, p2[3] = {0x22, 0xF1, 0x84};
+        uds_queue(ecu_sel, p1, 3);
+        uds_queue(ecu_sel, p2, 3);
+    } else if (b == B_X) {
+        uint8_t p[2] = {0x11, 0x01};
+        uds_queue(ecu_sel, p, 2);
+        toast(t, "UDS ECUReset (0x11 01) -> ECU %c. Watch its IDs go SILENT in the IDS", ECU_LETTER[ecu_sel]);
+    } else if (b == B_ZR) ecu_power_set(ecu_sel, !ecu_power[ecu_sel], t);
+    else if (b == B_B) tko_start(t);
+    else if (b == B_ZL) {
+        if (plat_usb_raw("Y1\r")) {
+            for (int i = 0; i < 3; i++) ecu_power[i] = true;
+            ulog_add(GREEN, "-> USB  Y1  power ON all ECUs (restore)");
+            toast(t, "Restore: all ECUs powered on");
+        }
+    }
+}
+
+static void tko_release(uint32_t b) {
+    if (b == B_A) tko_horn = false;
+}
+
 // ================================================================== drawing
 static Canvas *C;
 
@@ -1019,7 +1303,7 @@ static void draw_header(double t) {
     r = gfx_text(C, &FONT_MID, "sole", r.x + r.w, 12, FG, A_TL);
     gfx_text(C, &FONT_XS, "NX", r.x + r.w + 4, 22, DIM, A_TL);
     for (int i = 0; i < NTABS; i++) {
-        Rect tr = {182 + i * 122, 10, 116, 36};
+        Rect tr = {172 + i * 106, 10, 102, 36};
         gfx_rrect(C, tr.x, tr.y, tr.w, tr.h, 8, i == tab ? RED : PANEL2);
         txt(&FONT_B, TAB_NAMES[i], tr.x + tr.w / 2, tr.y + tr.h / 2, i == tab ? WHITE : DIM, A_C);
         hit_add(tr, HT_TAB, (uint32_t)i, 0);
@@ -1663,6 +1947,113 @@ static void draw_ir(double t) {
     for (unsigned i = 0; i < sizeof(tips) / sizeof(tips[0]); i++) txt(&FONT_S, tips[i], 708, 276 + (int)i * 26, i >= 8 ? AMBER : DIM, A_TL);
 }
 
+static void draw_ecu(double t) {
+    char buf[128];
+    if (src != SRC_USB) {
+        gfx_rrect(C, 12, 70, W - 24, 576, 12, PANEL);
+        txt(&FONT_MID, "ECU TOOLS - plug in a RAMN", W / 2, 200, FG, A_C);
+        static const char *l[] = {"UDS diagnostics over ISO-TP: TesterPresent, Read VIN / build date, ECU reset",
+                                  "ECU power control through RAMN's USB command set",
+                                  "JOY-CON TAKEOVER: power off ECU B + C, then impersonate all 8 of their",
+                                  "messages at their exact periods, with continued freshness counters and",
+                                  "valid CRC32 - your sticks become the steering wheel and pedals."};
+        for (int i = 0; i < 5; i++) txt(&FONT_M, l[i], W / 2, 270 + i * 34, i >= 2 ? AMBER : DIM, A_C);
+        return;
+    }
+    // --- ECU cards
+    for (int e = 0; e < 3; e++) {
+        int y = 70 + e * 160;
+        Rect card = {12, y, 410, 150};
+        bool sel = e == ecu_sel && !tko_on;
+        gfx_rrect(C, card.x, card.y, card.w, card.h, 12, PANEL);
+        if (sel) gfx_rrect_line(C, card.x, card.y, card.w, card.h, 12, 2, CYAN);
+        hit_add(card, HT_ECU, (uint32_t)e, 0);
+        snprintf(buf, sizeof(buf), "ECU %c", ECU_LETTER[e]);
+        txt(&FONT_MID, buf, 28, y + 10, FG, A_TL);
+        txt(&FONT_XS, ECU_ROLE[e], 28, y + 46, DIM, A_TL);
+        bool alive = t - ecu_alive_t[e] < 30;
+        // is the ECU itself talking? (its own messages, not ours)
+        static const uint32_t probe[3] = {R_CTL_STEER, R_CTL_ACCEL, R_CTL_KEY};
+        IdInfo *pe = find_id(probe[e]);
+        bool talking = pe && t - pe->last_ext < 0.5;
+        snprintf(buf, sizeof(buf), "power %s", ecu_power[e] ? "ON" : "OFF");
+        txt(&FONT_S, buf, 160, y + 14, ecu_power[e] ? GREEN : RED, A_TL);
+        txt(&FONT_S, talking ? "on bus" : "silent", 300, y + 14, talking ? GREEN : AMBER, A_TL);
+        txt(&FONT_XS, alive ? "UDS: answered" : "UDS: not pinged yet", 28, y + 64, alive ? GREEN : DIM, A_TL);
+        if (ecu_info[e][0]) txt(&FONT_XS, ecu_info[e], 180, y + 64, FG, A_TL);
+        static const char *bl[4] = {"PING [A]", "INFO [Y]", "RESET [X]", "POWER [ZR]"};
+        static const uint32_t bb[4] = {B_A, B_Y, B_X, B_ZR};
+        for (int k = 0; k < 4; k++) {
+            Rect r = {24 + k * 98, y + 92, 92, 44};
+            gfx_rrect(C, r.x, r.y, r.w, r.h, 8, PANEL2);
+            gfx_rrect_line(C, r.x, r.y, r.w, r.h, 8, 1, k == 2 || k == 3 ? RED : LINE);
+            txt(&FONT_XS, bl[k], r.x + r.w / 2, r.y + 22, FG, A_C);
+            hit_add(r, HT_ECU, (uint32_t)e, bb[k]);
+        }
+    }
+    Rect rs = {12, 552, 410, 48};
+    gfx_rrect(C, rs.x, rs.y, rs.w, rs.h, 10, COL(16, 50, 32));
+    txt(&FONT_B, "RESTORE ALL (Y1) [ZL]", rs.x + rs.w / 2, rs.y + 24, GREEN, A_C);
+    hit_add(rs, HT_TAP, B_ZL, 0);
+
+    // --- takeover panel
+    Rect tp = {434, 70, 420, 530};
+    gfx_rrect(C, tp.x, tp.y, tp.w, tp.h, 12, tko_on ? COL(48, 14, 12) : PANEL);
+    if (tko_on) gfx_rrect_line(C, tp.x, tp.y, tp.w, tp.h, 12, 3, ((int)(t * 3)) % 2 ? RED : AMBER);
+    txt(&FONT_B, "JOY-CON TAKEOVER", tp.x + 18, tp.y + 14, tko_on ? RED : FG, A_TL);
+    txt(&FONT_XS, "masquerade ECU B + C (8 message IDs)", tp.x + 18, tp.y + 44, DIM, A_TL);
+    static const char *steps[3] = {"1 power off ECU B + C (yB0 yC0)", "2 send their 8 IDs at exact periods",
+                                   "3 continue each counter + valid CRC32"};
+    for (int i = 0; i < 3; i++) txt(&FONT_S, steps[i], tp.x + 18, tp.y + 70 + i * 24, tko_on ? AMBER : DIM, A_TL);
+    IdInfo *eb = find_id(R_CTL_STEER), *ec = find_id(R_CTL_ACCEL);
+    bool bs = !eb || t - eb->last_ext > 0.3, cs = !ec || t - ec->last_ext > 0.3;
+    if (tko_on) {
+        snprintf(buf, sizeof(buf), "ECU B %s   ECU C %s", bs ? "silent OK" : "STILL TALKING", cs ? "silent OK" : "STILL TALKING");
+        txt(&FONT_S, buf, tp.x + 18, tp.y + 150, bs && cs ? GREEN : RED, A_TL);
+        // live controls
+        float fa = tko_accel / 4095.0f, fb = tko_brake / 4095.0f;
+        gfx_rrect(C, tp.x + 18, tp.y + 180, 60, 166, 8, PANEL2);
+        if (fa > 0) gfx_rrect(C, tp.x + 22, tp.y + 342 - (int)(158 * fa), 52, (int)(158 * fa), 6, GREEN);
+        txt(&FONT_XS, "ACCEL", tp.x + 48, tp.y + 352, FG, A_TC);
+        gfx_rrect(C, tp.x + 90, tp.y + 180, 60, 166, 8, PANEL2);
+        if (fb > 0) gfx_rrect(C, tp.x + 94, tp.y + 342 - (int)(158 * fb), 52, (int)(158 * fb), 6, RED);
+        txt(&FONT_XS, "BRAKE", tp.x + 120, tp.y + 352, FG, A_TC);
+        float a = ((float)tko_steer - 2047.0f) / 2047.0f * 2.356f;
+        float wx = tp.x + 290, wy = tp.y + 262;
+        gfx_ring(C, wx, wy, 80, 66, COL(70, 76, 92));
+        gfx_line(C, wx, wy, wx + cosf(a + 3.14159f) * 68, wy + sinf(a + 3.14159f) * 68, 11, COL(70, 76, 92));
+        gfx_line(C, wx, wy, wx + cosf(a) * 68, wy + sinf(a) * 68, 11, COL(70, 76, 92));
+        gfx_circle(C, wx + cosf(a - 1.5708f) * 73, wy + sinf(a - 1.5708f) * 73, 7, RED);
+        snprintf(buf, sizeof(buf), "steer %u", (unsigned)tko_steer);
+        txt(&FONT_XS, buf, (int)wx, (int)wy + 90, FG, A_TC);
+        static const char *bn[4] = {"off", "LEFT", "RIGHT", "HAZARD"};
+        snprintf(buf, sizeof(buf), "GEAR %d   BLINK %s   HORN %s", tko_gear, bn[tko_blink], tko_horn ? "ON" : "off");
+        txt(&FONT_S, buf, tp.x + 18, tp.y + 376, FG, A_TL);
+        int na = nalerts - tko_alerts0;
+        snprintf(buf, sizeof(buf), "%.0fs | IDS alerts since start: %d", t - tko_t0, na < 0 ? 0 : na);
+        txt(&FONT_S, buf, tp.x + 18, tp.y + 402, na > 0 ? AMBER : GREEN, A_TL);
+        txt(&FONT_XS, "L-stick gas | ZL brake | R-stick steer | Up/Dn gear", tp.x + 18, tp.y + 428, DIM, A_TL);
+        txt(&FONT_XS, "Left/Right blinker | Y hazard | A horn | B stop", tp.x + 18, tp.y + 444, DIM, A_TL);
+    } else {
+        static const char *why[] = {"Why it matters:", "a rate IDS sees normal periods,", "a counter check sees perfect sequences,",
+                                    "a CRC check sees valid CRCs.", "Only authentication (SecOC) or", "ECU-silence monitoring catch it.",
+                                    "", "Requires TX armed (hold + 2 s)."};
+        for (int i = 0; i < 8; i++) txt(&FONT_S, why[i], tp.x + 18, tp.y + 160 + i * 26, i == 0 ? FG : (i == 7 ? AMBER : DIM), A_TL);
+    }
+    Rect tb = {tp.x + 18, tp.y + tp.h - 70, tp.w - 36, 56};
+    gfx_rrect(C, tb.x, tb.y, tb.w, tb.h, 12, tko_on ? RED : COL(70, 18, 14));
+    txt(&FONT_B, tko_on ? "STOP TAKEOVER [B]" : "START TAKEOVER [B]", tb.x + tb.w / 2, tb.y + 28, WHITE, A_C);
+    hit_add(tb, HT_TAP, B_B, 0);
+
+    // --- UDS log
+    Rect lp = {866, 70, 398, 530};
+    gfx_rrect(C, lp.x, lp.y, lp.w, lp.h, 12, PANEL);
+    txt(&FONT_B, "UDS / COMMAND LOG", lp.x + 16, lp.y + 14, FG, A_TL);
+    for (int i = 0; i < nulog; i++) txt(&FONT_XS, ulog[i].s, lp.x + 14, lp.y + 50 + i * 33, ulog[i].col, A_TL);
+    if (!nulog) txt(&FONT_XS, "Arm TX (+ 2 s), select an ECU, press A to ping.", lp.x + 14, lp.y + 50, DIM, A_TL);
+    if (uds_wait) txt(&FONT_XS, "waiting for reply...", lp.x + 14, lp.y + lp.h - 24, AMBER, A_TL);
+}
+
 static void draw_footer(void) {
     gfx_fill(C, 0, H - 34, W, 34, PANEL);
     const char *hint;
@@ -1674,6 +2065,8 @@ static void draw_footer(void) {
                               : "Pin a signal in SNIFFER | ZR/ZL override it (TX armed) | + hold 2s arm TX | X IDS";
     else if (tab == TAB_SNIFF) hint = "Up/Down ID | Left/Right byte | A pin to gauge | B clear | Y fuzz | L/R tabs | - help";
     else if (tab == TAB_IDS) hint = "X IDS on/off | A re-learn baseline | B clear alerts | L/R tabs | - help";
+    else if (tab == TAB_ECU && tko_on) hint = "TAKEOVER: L-stick gas | ZL brake | R-stick steer | Up/Dn gear | </> blink | Y hazard | A horn | B stop";
+    else if (tab == TAB_ECU) hint = "Up/Dn ECU | A ping | Y read VIN+date | X reset | ZR power | B TAKEOVER | ZL restore | + arm";
     else if (tab == TAB_NFC) hint = "Tap a tag on the right Joy-Con stick | B clear history | L/R tabs | - help";
     else hint = "Point the right Joy-Con at IR sources | Y thermal/gray | L/R tabs | - help";
     txt(&FONT_S, hint, 16, H - 27, attract_on ? AMBER : DIM, A_TL);
@@ -1689,7 +2082,7 @@ static void draw_help(void) {
                                  {"X", "IDS on/off (re-learns)"}, {"Y", "fuzz selected ID 2 s"}};
     static const char *R[][2] = {{"D-pad", "blinkers | select ID/byte"}, {"+ (hold 2 s)", "arm TX on real bus"},
                                  {"-", "this help"}, {"- and +", "quit"}, {"L-stick click", "candump log on SD"},
-                                 {"Touchscreen", "tabs, buttons, rows"}, {"USB-C", "RAMN / CANable (slcan)"}};
+                                 {"Touchscreen", "tabs, buttons, rows"}, {"USB-C", "RAMN/CANable: slcan, gs_usb"}};
     for (int i = 0; i < 8; i++) {
         txt(&FONT_B, L[i][0], 70, 140 + i * 46, RED, A_TL);
         txt(&FONT_M, L[i][1], 260, 142 + i * 46, FG, A_TL);
@@ -1738,6 +2131,10 @@ static void switch_source(int s, double t) {
     ids_reset(t);
     stop_attract();
     ramn_mode = false;
+    tko_on = false;
+    uds_wait = false;
+    uq_n = 0;
+    for (int i = 0; i < 3; i++) { ecu_power[i] = true; ecu_alive_t[i] = -100; ecu_info[i][0] = 0; }
     if (s == SRC_USB) {
         tx_armed = false;
         plat_usb_set_tx(false);
@@ -1785,7 +2182,7 @@ bool app_frame(Canvas *c, const Input *in, double t) {
         if (src == SRC_SIM) toast(t, "SIM mode: TX is always on (virtual car)");
         else {
             tx_armed = !tx_armed;
-            if (!tx_armed) atk_clear();
+            if (!tx_armed) { atk_clear(); if (tko_on) tko_stop(t); }
             plat_usb_set_tx(tx_armed);
             plat_rumble(0.6f, 150);
             toast(t, tx_armed ? "TX ARMED - you are transmitting on a real bus" : "TX disarmed - read-only");
@@ -1809,6 +2206,19 @@ bool app_frame(Canvas *c, const Input *in, double t) {
         while ((n = plat_usb_poll(fr, 256)) > 0 && guard++ < 16)
             for (int i = 0; i < n; i++) ingest(&fr[i], t);
     }
+    if (tko_on) {
+        float g = in->stick_y > 0.08f ? in->stick_y : 0;
+        tko_accel = (uint16_t)(g > 1 ? 4095 : g * 4095);
+        float br = (held_bits & B_ZL) ? 1.0f : (in->stick_y < -0.2f ? -in->stick_y : 0);
+        tko_brake = (uint16_t)(br > 1 ? 4095 : br * 4095);
+        float sx = in->rstick_x;
+        if (sx > 1) sx = 1;
+        if (sx < -1) sx = -1;
+        if (fabsf(sx) < 0.06f) sx = 0;
+        tko_steer = (uint16_t)(2047 + sx * 2047);
+    }
+    tko_tick(t);
+    uds_tick(t);
     atk_tick(t, dt);
     ids_eval(t);
     if (!have_sel && nids) { sel_id = ids[0].id; have_sel = true; }
@@ -1862,6 +2272,7 @@ bool app_frame(Canvas *c, const Input *in, double t) {
             break;
         case TAB_SNIFF: draw_sniffer(t); break;
         case TAB_IDS: draw_ids(t); break;
+        case TAB_ECU: draw_ecu(t); break;
         case TAB_NFC: draw_nfc(t); break;
         case TAB_IR: draw_ir(t); break;
     }

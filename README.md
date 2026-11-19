@@ -26,8 +26,13 @@ The app auto-detects RAMN from its signal IDs, using names and encodings from th
 - **Dashboard:** steering wheel, pedals, gear, key, light switch, and a mirror of ECU D's own LED report.
 - **Armed attacks:** forged hazards, check engine, high beam and park brake. Each forged frame continues the real counter and carries a valid CRC32, and the IDS flags the counter collisions.
 
+### ECU tab (real RAMN)
+- **UDS over ISO-TP** to ECU B/C/D (0x7E1–0x7E3): TesterPresent, ReadDataByIdentifier (VIN F190, build date F184) with multi-frame flow control, and ECUReset.
+- **ECU power control** through RAMN's USB commands (`yB0`/`yB1`… and `Y1` to restore all).
+- **Joy-Con takeover:** powers off ECU B + C, then impersonates all 8 of their messages at their real periods, with continued counters and valid CRC32. The sticks become steering and pedals, and the IDS stays silent.
+
 ### Real car bus over USB-C (RAMN / CANable)
-Plug in a USB-CAN adapter that speaks **slcan** over USB serial, such as a RAMN board or a CANable with slcan firmware. The app switches to the real bus automatically at 500 kbit/s.
+Plug in a USB-CAN adapter: **slcan** over USB serial (RAMN, or a CANable with slcan firmware), or **gs_usb/candleLight** (1d50:606f) as a fallback. The app switches to the real bus automatically. It starts at 500 kbit/s and, if the bus stays silent, cycles 1M/250k/125k/800k/100k in listen-only mode until frames appear. If the stream stops, the app re-opens the channel.
 - It starts **read-only**: the adapter is opened in slcan **listen-only** (`L`). Hold **+** for 2 seconds to arm TX, which reopens it in normal mode (`O`). Only do this on a bus you own or have permission to test.
 - **Safe mode:** hold **ZL** while launching to disable USB, NFC and IR. A boot log is written to `sdmc:/switch/cansole-nx/boot.log`.
 - See **[DEMO.md](DEMO.md)** for the full demo script.

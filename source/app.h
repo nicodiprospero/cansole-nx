@@ -7,7 +7,7 @@
 
 #define APP_W 1280
 #define APP_H 720
-#define APP_VERSION_STR "1.1.0"
+#define APP_VERSION_STR "1.2.0"
 
 enum {
     B_A = 1 << 0, B_B = 1 << 1, B_X = 1 << 2, B_Y = 1 << 3,
@@ -20,6 +20,7 @@ enum {
 typedef struct {
     uint32_t held, down, up;  // button bitmasks
     float stick_y;            // left stick, +1 = up (gas), -1 = down (brake)
+    float rstick_x;           // right stick, -1 left .. +1 right (takeover steering)
     bool touching;
     int tx, ty;               // touch position in 1280x720 space
 } Input;

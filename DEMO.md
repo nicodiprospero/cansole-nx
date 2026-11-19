@@ -1,7 +1,7 @@
 # CANsole NX: Car Hacking Village demo script (Hardwear.io NL 2026)
 
 ## Before you start (5 min)
-- [ ] Switch charged and **CANsole NX v1.1** opens. Hold **ZL** while launching for safe mode if anything misbehaves.
+- [ ] Switch charged and **CANsole NX v1.2** opens. Hold **ZL** while launching for safe mode if anything misbehaves.
 - [ ] Open it once on the virtual car: drive, press ZR, check the banner and rumble.
 - [ ] Ask the crew for the RAMN board **and permission to transmit**. Write down the bitrate (default 500k).
 - [ ] Cable: Switch USB-C → RAMN USB. If the RAMN doesn't power up, use the dock's USB-A port or a powered hub.
@@ -41,6 +41,21 @@
    - **IDS tab:** COUNTER BREAK alerts. *"The defender's view: my forged counters collide with ECU B and C's real sequence. That's exactly what a counter-aware IDS catches."*
 5. Disarm: hold **+** again. Back to listen-only.
 
+## Act 6: The takeover, the finale (the IDS goes blind on real hardware)
+Go to the **ECU tab**. TX must be armed.
+1. **Diagnostics first (shows depth):** select ECU B and press **A** (TesterPresent: "ECU alive"). Press **Y** to read the VIN and build date. That's a multi-frame ISO-TP response; the app sends the flow-control frame itself.
+   *"This is UDS over ISO-TP, the same protocol a dealership tool speaks."*
+2. **Optional:** select ECU D and press **X** (ECUReset 0x11 01). The board reboots that ECU. The IDS tab shows **"0x1BB SILENT"**.
+3. **Press B: START TAKEOVER.**
+   - The Switch powers off ECU B and C through RAMN's own USB commands (`yB0` / `yC0`). That stands in for a bus-off attack.
+   - It then impersonates **all 8 of their messages at their exact periods** (10 ms and 100 ms), continuing every freshness counter with a valid CRC32.
+   - **Left stick = accelerator, ZL = brake, right stick = steering, D-pad = gear and blinkers, Y = hazards, A = horn.**
+   - ECU A's screen and the LEDs now follow *your Joy-Cons*.
+   *"I just replaced two ECUs with a Nintendo controller."*
+4. Show the **IDS tab: no alerts.** *"Rate normal, counters perfect, CRCs valid. A rate/counter IDS is blind to a clean masquerade. What catches it: authentication (SecOC), or noticing the ECU went silent/rebooted. That's why I powered them off before starting: there's no gap."*
+5. **Press B to stop.** B and C power back on. Their counters restart at 0, and the IDS flags it. *"And that's the forensic trace a good IDS keeps."*
+6. If anything looks off: **ZL = RESTORE ALL (`Y1`)** powers every ECU back on.
+
 ## Bonus (if time)
 - **NFC tab:** tap someone's badge on the right stick: UID and chip type. If it's MIFARE Classic: *"Crypto-1 was broken in 2008."*
 - **IR CAM tab:** point at a phone's face-unlock emitter or a TV remote. You can see the invisible IR.
@@ -53,4 +68,7 @@
 ## If something breaks
 - **App crashes on a tab:** stay on CLUSTER/SNIFFER/IDS. NFC and IR only start when their tab opens.
 - **RAMN not detected:** the header says `USB: plug RAMN/CANable`. Re-plug it. Check `sdmc:/switch/cansole-nx/boot.log`.
+- **Header shows `slcan 250k?`:** no frames yet, so the app is cycling bitrates (listen-only, harmless). It locks as soon as frames arrive.
+- **Frames stop:** the app re-opens the channel after 2.5 s (RAMN closes slcan if USB overflows).
+- **RAMN doesn't power from the Switch:** use a USB-C hub with power-delivery input, or ask the crew for a powered hub.
 - **Nothing works:** the self-running demo starts after 45 s idle on the virtual car. Let it run and talk over it.

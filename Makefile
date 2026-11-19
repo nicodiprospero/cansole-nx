@@ -18,7 +18,7 @@ INCLUDES    :=  source
 
 APP_TITLE   :=  CANsole NX
 APP_AUTHOR  :=  nicodiprospero
-APP_VERSION :=  1.1.0
+APP_VERSION :=  1.2.0
 ICON        :=  icon.jpg
 
 ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
