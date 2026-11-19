@@ -294,8 +294,8 @@ void plat_nfc_info(NfcInfo *out) {
                     NfcTagInfo ti;
                     memset(&ti, 0, sizeof(ti));
                     if (R_SUCCEEDED(nfcGetTagInfo(&nfc_dev, &ti))) {
-                        int n = ti.uid_length > 10 ? 10 : ti.uid_length;
-                        memcpy(nfc_cur.uid, ti.uid, (size_t)n);
+                        int n = ti.uid.uid_length > 10 ? 10 : ti.uid.uid_length;
+                        memcpy(nfc_cur.uid, ti.uid.uid, (size_t)n);
                         nfc_cur.uid_len = n;
                         nfc_cur.protocol = ti.protocol;
                         nfc_cur.tag_type = ti.tag_type;
