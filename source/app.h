@@ -7,7 +7,7 @@
 
 #define APP_W 1280
 #define APP_H 720
-#define APP_VERSION_STR "1.4.1"
+#define APP_VERSION_STR "1.4.2"
 
 enum {
     B_A = 1 << 0, B_B = 1 << 1, B_X = 1 << 2, B_Y = 1 << 3,

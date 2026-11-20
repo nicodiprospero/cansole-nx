@@ -865,7 +865,10 @@ static bool ir_watchdog(u64 now, Result rc, char *status, int status_len) {
     }
     u64 limit = ir_wireless ? 6000000000ULL : 3000000000ULL;
     // in TRACK mode an empty scene still produces samples, so the same watchdog applies
-    if (armTicksToNs(now - ir_last_new_tick) > limit) {
+    // ir_start() stamps ir_last_new_tick AFTER the caller read `now`; without this guard the unsigned
+    // subtraction wrapped around and the watchdog killed the camera a few ms after every start.
+    u64 elapsed = now > ir_last_new_tick ? armTicksToNs(now - ir_last_new_tick) : 0;
+    if (elapsed > limit) {
         plat_log("ir: no new data for %llus (rc=0x%X) - restarting", (unsigned long long)(limit / 1000000000ULL), (unsigned)rc);
         ir_fail("stalled");
         ir_stop();
