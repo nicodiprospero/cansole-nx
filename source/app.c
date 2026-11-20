@@ -1837,17 +1837,19 @@ static const char *nfc_proto_name(uint32_t p) {
 static const char *nfc_type_name(uint32_t ty) {
     if (ty & (1 << 6)) return "MIFARE Classic";
     if (ty & (1 << 1)) return "Type 2 (NTAG / Ultralight)";
-    if (ty & (1 << 3)) return "Type 4A (DESFire / smart card)";
+    if (ty & (1 << 3)) return "Type 4A (ISO-DEP: bank, DESFire, phone)";
     if (ty & (1 << 4)) return "Type 4B";
     if (ty & (1 << 2)) return "Type 3 (FeliCa)";
     if (ty & (1 << 0)) return "Type 1 (Topaz)";
     if (ty & (1 << 5)) return "Type 5 (ISO 15693)";
     return "unknown";
 }
-static const char *nfc_insight(uint32_t ty, int uid_len) {
+static const char *nfc_insight(uint32_t ty, const uint8_t *uid, int uid_len) {
+    if (uid_len == 4 && uid[0] == 0x08)
+        return "Random UID (starts 08): a phone or privacy-mode card. New ID every tap, so it can't be tracked or cloned by UID.";
     if (ty & (1 << 6)) return "MIFARE Classic: Crypto-1 was broken in 2008. Don't trust it for access control.";
     if (ty & (1 << 1)) return uid_len == 7 ? "7-byte UID NTAG: amiibo, badges, smart posters. UID is public data." : "Type 2 tag: memory pages readable by anyone nearby.";
-    if (ty & (1 << 3)) return "Type 4 / DESFire: real crypto (AES on EV1+). Much harder target.";
+    if (ty & (1 << 3)) return "ISO-DEP smart card (bank, transit, DESFire): real crypto inside, the UID alone proves nothing.";
     if (uid_len == 4) return "4-byte UID - possibly random per read (privacy mode) or a cloneable card.";
     return "UID alone should never be used as an authenticator: it's trivially cloned.";
 }
@@ -1880,7 +1882,7 @@ static void draw_nfc(double t) {
         snprintf(buf, sizeof(buf), "raw: protocol=0x%X type=0x%X", (unsigned)h->proto, (unsigned)h->type);
         txt(&FONT_XS, buf, 30, 416, LINE, A_TL);
         gfx_rrect(C, 30, 448, 724, 70, 10, PANEL2);
-        const char *ins = nfc_insight(h->type, h->uid_len);
+        const char *ins = nfc_insight(h->type, h->uid, h->uid_len);
         char l1[80], l2[80];
         int n = (int)strlen(ins), cut = n > 56 ? 56 : n;
         while (cut < n && cut > 30 && ins[cut] != ' ') cut--;
