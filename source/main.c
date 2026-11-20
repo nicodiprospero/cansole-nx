@@ -82,7 +82,7 @@ static void log_load_previous(void) {
         int idx = (th + tn) % 48;
         if (tn == 48) th = (th + 1) % 48;
         else tn++;
-        snprintf(tail[idx], sizeof(tail[idx]), "prev %s", buf);
+        snprintf(tail[idx], sizeof(tail[idx]), "prev %.100s", buf);
     }
     long size = ftell(f);
     fclose(f);
