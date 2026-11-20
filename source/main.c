@@ -89,6 +89,7 @@ static volatile int usb_state_v = USB_OFF;
 static char usb_label_s[64] = "USB: off";
 static Thread usb_thread;
 static volatile bool usb_run;
+static bool usb_hs_up;
 static bool usb_thread_ok;
 static UsbHsClientIfSession if_sess;
 static UsbHsClientEpSession ep_in, ep_out;
@@ -443,6 +444,7 @@ static void usb_start(void) {
     usb_ctrlbuf = memalign(0x1000, 0x1000);
     Result rc = usbHsInitialize();
     plat_log("usbHsInitialize rc=0x%X", (unsigned)rc);
+    if (R_SUCCEEDED(rc)) usb_hs_up = true;
     if (R_FAILED(rc) || !usb_inbuf || !usb_outbuf || !usb_ctrlbuf) {
         usb_state_v = USB_ERROR;
         snprintf(usb_label_s, sizeof(usb_label_s), "USB host unavailable (0x%X)", (unsigned)rc);
@@ -460,11 +462,16 @@ static void usb_start(void) {
 static void usb_stop(void) {
     if (usb_thread_ok) {
         usb_run = false;
+        plat_log("shutdown: joining usb thread");
         threadWaitForExit(&usb_thread);
         threadClose(&usb_thread);
         usb_thread_ok = false;
     }
-    if (usb_state_v != USB_ERROR && !g_safe_mode) usbHsExit();
+    if (usb_hs_up) {
+        plat_log("shutdown: usbHsExit");
+        usbHsExit();
+        usb_hs_up = false;
+    }
 }
 
 int plat_usb_state(void) { return usb_state_v; }
@@ -544,8 +551,10 @@ void plat_nfc_enable(bool on) {
         else
             snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Could not start detection (0x%X)", (unsigned)rc);
     } else if (!on && nfc_inited) {
+        plat_log("nfc: stop (dev=%d)", nfc_have_dev);
         if (nfc_have_dev) nfcStopDetection(&nfc_dev);
         nfcExit();
+        plat_log("nfc: exited");
         nfc_inited = nfc_have_dev = false;
         nfc_prev_state = -1;
     }
@@ -621,8 +630,10 @@ void plat_ir_enable(bool on) {
         else
             snprintf(ir_status, sizeof(ir_status), "IR start failed (0x%X) - try a detached Joy-Con", (unsigned)rc);
     } else if (!on && ir_inited) {
+        plat_log("ir: stop (running=%d)", ir_running);
         if (ir_running) irsStopImageProcessor(ir_handle);
         irsExit();
+        plat_log("ir: exited");
         ir_inited = ir_running = false;
     }
 }
@@ -701,7 +712,9 @@ int main(int argc, char **argv) {
         in.up = map_buttons(padGetButtonsUp(&g_pad));
         in.held = map_buttons(padGetButtons(&g_pad));
         HidAnalogStickState ls = padGetStickPos(&g_pad, 0);
+        HidAnalogStickState rs = padGetStickPos(&g_pad, 1);
         in.stick_y = ls.y / 32767.0f;
+        in.rstick_x = rs.x / 32767.0f;
         HidTouchScreenState ts = {0};
         if (hidGetTouchScreenStates(&ts, 1) && ts.count > 0) {
             in.touching = true;
@@ -720,8 +733,10 @@ int main(int argc, char **argv) {
 
     plat_log("exit requested");
     rumble_send(0);
+    plat_log("shutdown: app (nfc/ir off)");
     app_shutdown();
     usb_stop();
+    plat_log("shutdown: framebuffer");
     framebufferClose(&fb);
     appletSetMediaPlaybackState(false);
     plat_log("clean exit");
