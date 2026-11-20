@@ -163,6 +163,7 @@ static bool ir_on; static uint8_t irimg[320 * 240];
 void plat_ir_enable(bool on) { ir_on = on; }
 static int host_ir_mode;
 void plat_ir_set_mode(int mode) { host_ir_mode = mode; }
+void plat_ir_retry(void) {}
 int plat_ir_blobs(IrBlob *out, int max, char *st, int n) {
     if (!ir_on || host_ir_mode != 2) return -1;
     static double ph = 0;

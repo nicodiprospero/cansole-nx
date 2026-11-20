@@ -990,7 +990,8 @@ static void press(uint32_t b, double t) {
     } else if (tab == TAB_NFC) {
         if (b == B_B) n_nfc_hist = 0;
     } else if (tab == TAB_IR) {
-        if (b == B_Y || b == B_A) ir_thermal = !ir_thermal;
+        if (b == B_Y) ir_thermal = !ir_thermal;
+        else if (b == B_A) { plat_ir_retry(); toast(t, "IR: retrying the camera"); }
         else if (b == B_X) {
             ir_mode = (ir_mode + 1) % 3;
             plat_ir_set_mode(ir_mode);
@@ -2349,7 +2350,7 @@ static void draw_footer(void) {
     else if (tab == TAB_ECU && tko_on) hint = "TAKEOVER: L-stick gas | ZL brake | R-stick steer | Up/Dn gear | </> blink | Y hazard | A horn | B stop";
     else if (tab == TAB_ECU) hint = "Up/Dn ECU | A ping | Y read VIN+date | X reset | ZR power | B TAKEOVER | ZL restore | + arm";
     else if (tab == TAB_NFC) hint = "Tap a tag on the right Joy-Con stick | B clear history | L/R tabs | - help";
-    else if (tab == TAB_IR) hint = "Aim the bottom tip of the right Joy-Con | Y thermal/gray | X sharp/fast/track | L/R tabs | - help";
+    else if (tab == TAB_IR) hint = "Aim the bottom tip of the right Joy-Con | Y thermal/gray | X sharp/fast/track | A retry | - help";
     else hint = "A Wi-Fi CAN bridge on/off | Up/Down scroll log | Y newest | L/R tabs | - help";
     txt(&FONT_S, hint, 16, H - 27, attract_on ? AMBER : DIM, A_TL);
     txt(&FONT_XS, "v" APP_VERSION_STR, W - 14, H - 25, LINE, A_TR);

@@ -36,6 +36,7 @@ void plat_nfc_info(NfcInfo *out);
 
 // ---- Joy-Con IR camera
 void plat_ir_enable(bool on);
+void plat_ir_retry(void);         // talk to the camera again after it was given up on
 void plat_ir_set_mode(int mode);  // 0 SHARP 160x120 image, 1 FAST 80x60 image, 2 TRACK (blob clustering)
 const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len);  // 8-bit grayscale or NULL
 typedef struct {

@@ -692,6 +692,24 @@ static int ir_fps, ir_fps_n;
 static char ir_status[96] = "";
 static IrBlob ir_blobs[16];
 static int ir_nblobs;
+// Safety: a Joy-Con whose IR/NFC chip stops answering makes every irs call slow. Never hammer it:
+// after 2 stalls (or one call that blocks > 0.4 s) we stop talking to the camera until the user retries.
+static int ir_fails;
+static bool ir_gave_up;
+static void ir_fail(const char *why) {
+    ir_fails++;
+    plat_log("ir: failure %d (%s)", ir_fails, why);
+    if (ir_fails >= 2) {
+        ir_gave_up = true;
+        plat_log("ir: giving up until retry");
+    }
+}
+void plat_ir_retry(void) {
+    ir_fails = 0;
+    ir_gave_up = false;
+    ir_retry_tick = 0;
+    plat_log("ir: retry requested");
+}
 
 static bool ir_find_joycon(HidNpadIdType *out, bool *wireless) {
     if (hidGetNpadStyleSet(HidNpadIdType_Handheld) & HidNpadStyleTag_NpadHandheld) {
@@ -745,6 +763,7 @@ static void ir_start(HidNpadIdType id, bool wireless) {
         }
     }
     ir_running = R_SUCCEEDED(rc);
+    if (!ir_running) ir_fail("start failed");
     ir_run_mode = ir_mode;
     ir_id = id;
     ir_wireless = wireless;
@@ -797,6 +816,11 @@ static bool ir_service(u64 now, char *status, int status_len) {
         snprintf(status, (size_t)status_len, "%s", ir_status);
         return false;
     }
+    if (ir_gave_up) {
+        if (ir_running) ir_stop();
+        snprintf(status, (size_t)status_len, "IR not responding - reset the right Joy-Con, then A to retry");
+        return false;
+    }
     HidNpadIdType id;
     bool wl = false;
     if (!ir_find_joycon(&id, &wl)) {
@@ -826,6 +850,7 @@ static bool ir_service(u64 now, char *status, int status_len) {
 }
 
 static void ir_got_sample(u64 now) {
+    ir_fails = 0;
     ir_last_new_tick = now;
     ir_have_data = true;
     ir_fps_n++;
@@ -842,6 +867,7 @@ static bool ir_watchdog(u64 now, Result rc, char *status, int status_len) {
     // in TRACK mode an empty scene still produces samples, so the same watchdog applies
     if (armTicksToNs(now - ir_last_new_tick) > limit) {
         plat_log("ir: no new data for %llus (rc=0x%X) - restarting", (unsigned long long)(limit / 1000000000ULL), (unsigned)rc);
+        ir_fail("stalled");
         ir_stop();
         ir_retry_tick = 0;
         snprintf(status, (size_t)status_len, "IR stalled - restarting...");
@@ -860,7 +886,14 @@ const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len) {
     if (ir_run_mode == 2) return NULL;
     IrsImageTransferProcessorState st;
     memset(&st, 0, sizeof(st));
+    u64 c0 = armGetSystemTick();
     Result rc = irsGetImageTransferProcessorState(ir_handle, ir_buf, (size_t)(ir_w * ir_h), &st);
+    if (armTicksToNs(armGetSystemTick() - c0) > 400000000ULL) {
+        ir_fail("call blocked > 0.4 s");
+        ir_stop();
+        snprintf(status, (size_t)status_len, "IR camera is answering too slowly - stopped");
+        return NULL;
+    }
     if (R_SUCCEEDED(rc) && (s64)st.sampling_number != ir_last_sample) {
         ir_last_sample = (s64)st.sampling_number;
         ir_got_sample(now);
@@ -880,7 +913,14 @@ int plat_ir_blobs(IrBlob *out, int max, char *status, int status_len) {
     IrsClusteringProcessorState st;
     s32 total = 0;
     memset(&st, 0, sizeof(st));
+    u64 c0 = armGetSystemTick();
     Result rc = irsGetClusteringProcessorStates(ir_handle, &st, 1, &total);
+    if (armTicksToNs(armGetSystemTick() - c0) > 400000000ULL) {
+        ir_fail("call blocked > 0.4 s");
+        ir_stop();
+        snprintf(status, (size_t)status_len, "IR camera is answering too slowly - stopped");
+        return -1;
+    }
     if (R_SUCCEEDED(rc) && total > 0 && st.sampling_number != ir_last_sample) {
         ir_last_sample = st.sampling_number;
         ir_got_sample(now);
