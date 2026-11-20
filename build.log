@@ -1,0 +1,8 @@
+app.c
+font_data.c
+gfx.c
+main.c
+slcan.c
+built ... cansole-nx.nacp
+linking cansole-nx.elf
+built ... cansole-nx.nro
