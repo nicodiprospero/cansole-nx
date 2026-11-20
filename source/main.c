@@ -519,7 +519,8 @@ static bool nfc_inited, nfc_have_dev;
 static NfcDeviceHandle nfc_dev;
 static NfcInfo nfc_cur;
 static int nfc_prev_state = -1;
-static u64 nfc_restart_tick;
+static u64 nfc_restart_tick, nfc_info_tick;
+static bool nfc_info_ok;
 
 void plat_nfc_enable(bool on) {
     if (on && g_safe_mode) {
@@ -569,10 +570,20 @@ void plat_nfc_info(NfcInfo *out) {
         if (R_SUCCEEDED(nfcGetDeviceState(&nfc_dev, &st))) {
             if ((int)st != nfc_prev_state) plat_log("nfc: state %d", (int)st);
             if (st == NfcDeviceState_TagFound || st == NfcDeviceState_TagMounted) {
-                if (nfc_prev_state != (int)st) {
+                u64 now = armGetSystemTick();
+                if (nfc_prev_state != (int)st) nfc_info_ok = false;
+                // read the tag info on arrival, and retry every 200 ms if the first read failed
+                if (!nfc_info_ok && (nfc_prev_state != (int)st || armTicksToNs(now - nfc_info_tick) > 200000000ULL)) {
+                    nfc_info_tick = now;
                     NfcTagInfo ti;
                     memset(&ti, 0, sizeof(ti));
-                    if (R_SUCCEEDED(nfcGetTagInfo(&nfc_dev, &ti))) {
+                    Result irc = nfcGetTagInfo(&nfc_dev, &ti);
+                    if (R_FAILED(irc)) {
+                        plat_log("nfc: GetTagInfo rc=0x%X", (unsigned)irc);
+                        snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Tag seen, info read failed (0x%X) - hold still", (unsigned)irc);
+                    } else {
+                        nfc_info_ok = true;
+                        plat_log("nfc: tag uid_len=%d proto=0x%X type=0x%X", (int)ti.uid.uid_length, (unsigned)ti.protocol, (unsigned)ti.tag_type);
                         int n = ti.uid.uid_length > 10 ? 10 : ti.uid.uid_length;
                         memcpy(nfc_cur.uid, ti.uid.uid, (size_t)n);
                         nfc_cur.uid_len = n;
@@ -582,7 +593,7 @@ void plat_nfc_info(NfcInfo *out) {
                     }
                 }
                 nfc_cur.state = NFC_TAG;
-                snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Tag detected");
+                if (nfc_info_ok) snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Tag detected");
             } else if (st == NfcDeviceState_TagRemoved || st == NfcDeviceState_Initialized) {
                 // Re-arm detection, but never faster than every 1.5 s: the state machine is
                 // asynchronous and restarting every frame keeps the reader from ever seeing a tag.
@@ -598,6 +609,8 @@ void plat_nfc_info(NfcInfo *out) {
             } else if (st == NfcDeviceState_SearchingForTag) {
                 nfc_cur.state = NFC_SEARCHING;
                 snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Searching for a tag...");
+            } else {
+                snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Reader state %d", (int)st);
             }
             nfc_prev_state = (int)st;
         }
