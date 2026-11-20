@@ -300,6 +300,7 @@ static int src = SRC_SIM;
 static bool src_is_sim(void) { return src == SRC_SIM; }
 static int ecu_sel;
 static void ecu_press(uint32_t b, double t);
+static void demo_reset(double t);
 static void tko_release(uint32_t b);
 static int tab = TAB_CLUSTER;
 static bool tx_armed = true;
@@ -823,7 +824,7 @@ static void gauge_draw(Canvas *c, Gauge *g, float value, bool alive) {
 }
 
 // ---------------------------------------------------------------- touch map
-enum { HT_TAB, HT_QUIT, HT_HELP, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE, HT_ECU };
+enum { HT_TAB, HT_QUIT, HT_HELP, HT_RESET, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE, HT_ECU };
 typedef struct { Rect r; int type; uint32_t a, b; } Hit;
 static Hit hits[96];
 static int nhits;
@@ -905,6 +906,7 @@ static void press(uint32_t b, double t) {
     if (b == B_L) { tab = (tab + NTABS - 1) % NTABS; return; }
     if (b == B_R) { tab = (tab + 1) % NTABS; return; }
     if (b == B_LSTICK) { toggle_log(t); return; }
+    if (b == B_RSTICK) { demo_reset(t); return; }
     if (b == B_X && tab <= TAB_IDS) {
         ids_on = !ids_on;
         if (ids_on) { ids_reset(t); toast(t, "IDS on - learning baseline for 6 s"); }
@@ -1000,6 +1002,7 @@ static void tap(int x, int y, double t) {
             case HT_TAB: tab = (int)h->a; break;
             case HT_QUIT: quit_req = true; break;
             case HT_HELP: show_help = !show_help; break;
+            case HT_RESET: demo_reset(t); break;
             case HT_HOLD: press(h->a, t); touch_hold_bits |= h->a; break;
             case HT_TAP: press(h->a, t); release(h->a); break;
             case HT_ROW: sel_id = h->a; have_sel = true; break;
@@ -1321,15 +1324,15 @@ static void draw_header(double t) {
         hit_add(tr, HT_TAB, (uint32_t)i, 0);
     }
     char line[96], l2[96];
-    if (src == SRC_SIM) snprintf(line, sizeof(line), "SIM car  |  %s", plat_usb_label());
+    if (src == SRC_SIM) snprintf(line, sizeof(line), "SIM car | %s", plat_usb_label());
     else snprintf(line, sizeof(line), "%s%s", ramn_mode ? "RAMN | " : "", plat_usb_label());
-    if ((int)strlen(line) > 36) line[36] = 0;
-    txt(&FONT_S, line, 1170, 8, src == SRC_SIM ? CYAN : GREEN, A_TR);
+    if ((int)strlen(line) > 32) line[32] = 0;
+    txt(&FONT_S, line, 1124, 8, src == SRC_SIM ? CYAN : GREEN, A_TR);
     const char *tx = src == SRC_SIM ? "TX: SIM" : (tx_armed ? "TX ARMED" : "TX LOCKED");
     uint32_t txc = src == SRC_SIM ? AMBER : (tx_armed ? RED : GREEN);
     snprintf(l2, sizeof(l2), "%d msg/s  %d IDs  ", rate_get(&rx_rate, t), nids);
     int total = gfx_text_w(&FONT_S, l2) + gfx_text_w(&FONT_S, tx) + (log_fp ? gfx_text_w(&FONT_S, "  REC") : 0);
-    Rect sr = gfx_text(C, &FONT_S, l2, 1170 - total, 32, DIM, A_TL);
+    Rect sr = gfx_text(C, &FONT_S, l2, 1124 - total, 32, DIM, A_TL);
     sr = gfx_text(C, &FONT_S, tx, sr.x + sr.w, 32, txc, A_TL);
     if (log_fp) gfx_text(C, &FONT_S, "  REC", sr.x + sr.w, 32, RED, A_TL);
     Rect qb = {W - 50, 10, 38, 36}, hb = {W - 96, 10, 38, 36};
@@ -1339,6 +1342,16 @@ static void draw_header(double t) {
     gfx_rrect(C, hb.x, hb.y, hb.w, hb.h, 8, PANEL2);
     txt(&FONT_B, "?", hb.x + 19, hb.y + 18, DIM, A_C);
     hit_add(hb, HT_HELP, 0, 0);
+    Rect rb = {W - 142, 10, 38, 36};  // reset demo (also R-stick click)
+    gfx_rrect(C, rb.x, rb.y, rb.w, rb.h, 8, PANEL2);
+    {
+        float cx = rb.x + 19.0f, cy = rb.y + 18.0f;
+        gfx_ring(C, cx, cy, 11.0f, 7.5f, DIM);
+        gfx_fill(C, (int)cx, (int)cy - 12, 13, 9, PANEL2);
+        float tri[6] = {cx + 6.5f, cy - 9.25f, cx - 0.5f, cy - 15.0f, cx - 0.5f, cy - 3.5f};
+        gfx_poly(C, tri, 3, DIM);
+    }
+    hit_add(rb, HT_RESET, 0, 0);
     if (plus_t >= 0) {
         float p = (float)((t - plus_t) / 2.0);
         if (p > 1) p = 1;
@@ -2102,7 +2115,7 @@ static void draw_help(void) {
                                  {"X", "IDS on/off (re-learns)"}, {"Y", "fuzz selected ID 2 s"}};
     static const char *R[][2] = {{"D-pad", "blinkers | select ID/byte"}, {"+ (hold 2 s)", "arm TX on real bus"},
                                  {"-", "this help"}, {"- and +", "quit"}, {"L-stick click", "candump log on SD"},
-                                 {"Touchscreen", "tabs, buttons, rows"}, {"USB-C", "RAMN/CANable: slcan, gs_usb"}};
+                                 {"R-stick click", "reset the demo"}, {"USB-C", "RAMN/CANable: slcan, gs_usb"}};
     for (int i = 0; i < 8; i++) {
         txt(&FONT_B, L[i][0], 70, 140 + i * 46, RED, A_TL);
         txt(&FONT_M, L[i][1], 260, 142 + i * 46, FG, A_TL);
@@ -2140,6 +2153,37 @@ void app_shutdown(void) {
     free(bg_rpm.px);
     free(bg_spd.px);
     free(bg_pin.px);
+}
+
+// One button back to a clean state between demo acts (header icon or R-stick click).
+static void demo_reset(double t) {
+    if (tko_on) tko_stop(t);
+    bool any_off = !ecu_power[0] || !ecu_power[1] || !ecu_power[2];
+    if (src == SRC_USB && any_off && plat_usb_raw("Y1\r"))
+        for (int i = 0; i < 3; i++) ecu_power[i] = true;
+    stop_attract();
+    atk_clear();
+    atk_level = 1;
+    secoc_on = false;
+    memset(pins, 0, sizeof(pins));
+    next_slot = 0;
+    have_sel = false;
+    uds_wait = false;
+    uq_n = 0;
+    show_help = false;
+    ids_on = true;
+    ids_reset(t);
+    tab = TAB_CLUSTER;
+    if (src == SRC_SIM) {
+        car_reset(t);
+        car.bl = car.br = false;
+        toast(t, "Reset: fresh car, attack L1, SecOC off, IDS re-learning");
+    } else {
+        if (tx_armed) { tx_armed = false; plat_usb_set_tx(false); }
+        toast(t, "Reset: takeover off, all ECUs on, TX disarmed, IDS re-learning");
+    }
+    plat_log("demo reset (src=%d)", src);
+    plat_rumble(0.4f, 100);
 }
 
 static void switch_source(int s, double t) {

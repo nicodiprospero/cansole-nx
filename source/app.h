@@ -14,7 +14,7 @@ enum {
     B_L = 1 << 4, B_R = 1 << 5, B_ZL = 1 << 6, B_ZR = 1 << 7,
     B_PLUS = 1 << 8, B_MINUS = 1 << 9,
     B_UP = 1 << 10, B_DOWN = 1 << 11, B_LEFT = 1 << 12, B_RIGHT = 1 << 13,
-    B_LSTICK = 1 << 14,
+    B_LSTICK = 1 << 14, B_RSTICK = 1 << 15,
 };
 
 typedef struct {

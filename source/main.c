@@ -685,6 +685,7 @@ static uint32_t map_buttons(u64 k) {
     if (k & HidNpadButton_Left) b |= B_LEFT;
     if (k & HidNpadButton_Right) b |= B_RIGHT;
     if (k & HidNpadButton_StickL) b |= B_LSTICK;
+    if (k & HidNpadButton_StickR) b |= B_RSTICK;
     return b;
 }
 
