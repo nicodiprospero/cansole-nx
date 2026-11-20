@@ -607,7 +607,11 @@ add:
     if (sev != SEV_INFO) {
         ids_last_hit = t;
         snprintf(ids_last_msg, sizeof(ids_last_msg), "%s", txt);
-        plat_rumble(sev == SEV_CRIT ? 0.9f : 0.5f, sev == SEV_CRIT ? 220 : 120);
+        static double last_buzz = -10;  // one short buzz per 1.5 s, not one per alert
+        if (t - last_buzz > 1.5) {
+            last_buzz = t;
+            plat_rumble(sev == SEV_CRIT ? 0.5f : 0.3f, sev == SEV_CRIT ? 140 : 80);
+        }
     }
 }
 
@@ -1943,11 +1947,16 @@ static void draw_ir(double t) {
     if (img) {
         snprintf(buf, sizeof(buf), "max %d   mean %ld   hot px %d", maxv, (iw * ih) > 0 ? sum / (iw * ih) : 0L, bright);
         txt(&FONT_M, buf, 708, 152, FG, A_TL);
-        bool hit = bright > 25;
+        // a source = a small saturated spot (remote LED, face-unlock emitter); a big bright
+        // area is just the Joy-Con's own flood light bouncing off something close
+        int npx = iw * ih;
+        bool hit = bright >= 3 && bright < npx / 40;
+        bool flood = bright >= npx / 40;
         gfx_rrect(C, 708, 190, 538, 60, 10, hit ? RED : PANEL2);
-        txt(&FONT_B, hit ? "IR SOURCE DETECTED" : "no strong IR source", 977, 220, hit ? WHITE : DIM, A_C);
+        txt(&FONT_B, hit ? "IR SOURCE DETECTED" : flood ? "too close: flood-light glare" : "no strong IR source", 977, 220,
+            hit ? WHITE : flood ? AMBER : DIM, A_C);
     }
-    static const char *tips[] = {"The Joy-Con R has a 320x240 infrared camera", "+ IR flood light. Point it at:",
+    static const char *tips[] = {"Camera = black window at the BOTTOM tip of", "the right Joy-Con. Aim that edge at:",
                                  "", " - a TV remote while pressing a button",
                                  " - a phone's Face ID / face-unlock emitter", " - CCTV cameras (IR night-vision LEDs)",
                                  " - the sensor bar of a smart TV", "", "Humans can't see 850-940 nm IR,",

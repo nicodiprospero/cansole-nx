@@ -519,6 +519,7 @@ static bool nfc_inited, nfc_have_dev;
 static NfcDeviceHandle nfc_dev;
 static NfcInfo nfc_cur;
 static int nfc_prev_state = -1;
+static u64 nfc_restart_tick;
 
 void plat_nfc_enable(bool on) {
     if (on && g_safe_mode) {
@@ -545,6 +546,8 @@ void plat_nfc_enable(bool on) {
         }
         nfc_have_dev = true;
         rc = nfcStartDetection(&nfc_dev, NfcProtocol_All);
+        nfc_restart_tick = armGetSystemTick();
+        plat_log("nfc: start detection rc=0x%X", (unsigned)rc);
         nfc_cur.state = R_SUCCEEDED(rc) ? NFC_SEARCHING : NFC_ERROR;
         if (R_SUCCEEDED(rc))
             snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Searching for a tag...");
@@ -564,6 +567,7 @@ void plat_nfc_info(NfcInfo *out) {
     if (nfc_inited && nfc_have_dev) {
         NfcDeviceState st;
         if (R_SUCCEEDED(nfcGetDeviceState(&nfc_dev, &st))) {
+            if ((int)st != nfc_prev_state) plat_log("nfc: state %d", (int)st);
             if (st == NfcDeviceState_TagFound || st == NfcDeviceState_TagMounted) {
                 if (nfc_prev_state != (int)st) {
                     NfcTagInfo ti;
@@ -580,8 +584,15 @@ void plat_nfc_info(NfcInfo *out) {
                 nfc_cur.state = NFC_TAG;
                 snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Tag detected");
             } else if (st == NfcDeviceState_TagRemoved || st == NfcDeviceState_Initialized) {
-                nfcStopDetection(&nfc_dev);
-                nfcStartDetection(&nfc_dev, NfcProtocol_All);
+                // Re-arm detection, but never faster than every 1.5 s: the state machine is
+                // asynchronous and restarting every frame keeps the reader from ever seeing a tag.
+                u64 now = armGetSystemTick();
+                if (armTicksToNs(now - nfc_restart_tick) > 1500000000ULL) {
+                    nfc_restart_tick = now;
+                    if (st == NfcDeviceState_TagRemoved) nfcStopDetection(&nfc_dev);
+                    Result rc = nfcStartDetection(&nfc_dev, NfcProtocol_All);
+                    plat_log("nfc: re-arm from state %d rc=0x%X", (int)st, (unsigned)rc);
+                }
                 nfc_cur.state = NFC_SEARCHING;
                 snprintf(nfc_cur.status, sizeof(nfc_cur.status), "Searching for a tag...");
             } else if (st == NfcDeviceState_SearchingForTag) {
@@ -599,8 +610,8 @@ static bool ir_inited, ir_running;
 static IrsIrCameraHandle ir_handle;
 static u8 *ir_buf;
 static char ir_status[96] = "";
-#define IR_W 320
-#define IR_H 240
+#define IR_W 160  // 160x120 streams ~4x faster than the full 320x240
+#define IR_H 120
 
 void plat_ir_enable(bool on) {
     if (on && g_safe_mode) {
@@ -621,6 +632,7 @@ void plat_ir_enable(bool on) {
         if (R_SUCCEEDED(rc)) {
             IrsImageTransferProcessorConfig cfg;
             irsGetDefaultImageTransferProcessorConfig(&cfg);
+            cfg.format = IrsImageTransferProcessorFormat_160x120;
             rc = irsRunImageTransferProcessor(ir_handle, &cfg, 0x100000);
         }
         ir_running = R_SUCCEEDED(rc);
