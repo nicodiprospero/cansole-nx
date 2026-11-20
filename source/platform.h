@@ -36,6 +36,7 @@ void plat_nfc_info(NfcInfo *out);
 
 // ---- Joy-Con IR camera
 void plat_ir_enable(bool on);
+void plat_ir_set_fast(bool fast);  // 80x60 instead of 160x120 (faster over Bluetooth)
 const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len);  // 8-bit grayscale or NULL
 
 // ---- files / diagnostics

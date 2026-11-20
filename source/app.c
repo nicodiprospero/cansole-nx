@@ -824,7 +824,7 @@ static void gauge_draw(Canvas *c, Gauge *g, float value, bool alive) {
 }
 
 // ---------------------------------------------------------------- touch map
-enum { HT_TAB, HT_QUIT, HT_HELP, HT_RESET, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE, HT_ECU };
+enum { HT_TAB, HT_QUIT, HT_HELP, HT_RESET, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE, HT_IRFAST, HT_ECU };
 typedef struct { Rect r; int type; uint32_t a, b; } Hit;
 static Hit hits[96];
 static int nhits;
@@ -840,6 +840,7 @@ static NfcHist nfc_hist[10];
 static int n_nfc_hist;
 static bool nfc_enabled, ir_enabled;
 static bool ir_thermal = true;
+static bool ir_fast;
 
 // ---------------------------------------------------------------- logging
 static void toggle_log(double t) {
@@ -981,6 +982,7 @@ static void press(uint32_t b, double t) {
         if (b == B_B) n_nfc_hist = 0;
     } else if (tab == TAB_IR) {
         if (b == B_Y || b == B_A) ir_thermal = !ir_thermal;
+        else if (b == B_X) { ir_fast = !ir_fast; plat_ir_set_fast(ir_fast); toast(t, ir_fast ? "IR FAST: 80x60, best for a detached Joy-Con" : "IR SHARP: 160x120"); }
     }
 }
 
@@ -1008,6 +1010,7 @@ static void tap(int x, int y, double t) {
             case HT_ROW: sel_id = h->a; have_sel = true; break;
             case HT_BYTE: sel_id = h->a; have_sel = true; byte_cur = (int)h->b; break;
             case HT_IRMODE: ir_thermal = !ir_thermal; break;
+            case HT_IRFAST: ir_fast = !ir_fast; plat_ir_set_fast(ir_fast); break;
             case HT_ECU:
                 ecu_sel = (int)h->a;
                 if (h->b) { press(h->b, t); release(h->b); }
@@ -1923,60 +1926,89 @@ static uint32_t thermal(int v) {
 }
 
 static void draw_ir(double t) {
-    (void)t;
     char status[96] = "";
     int iw = 0, ih = 0;
     const uint8_t *img = plat_ir_frame(&iw, &ih, status, sizeof(status));
     int ox = 24, oy = 76, dw = 640, dh = 480;
     gfx_fill(C, ox - 4, oy - 4, dw + 8, dh + 8, LINE);
     int maxv = 0, bright = 0;
-    long sum = 0;
-    if (img && iw > 0 && ih > 0) {
+    long sum = 0, bx = 0, by = 0;
+    if (img && iw > 1 && ih > 1) {
+        // bilinear upscale: low-res IR (160x120 / 80x60) still looks smooth on the 640x480 view
+        static int fx[640];
+        for (int x = 0; x < dw; x++) fx[x] = x * (iw - 1) * 256 / (dw - 1);
         for (int y = 0; y < dh; y++) {
-            const uint8_t *srow = img + (size_t)(y * ih / dh) * iw;
+            int fy = y * (ih - 1) * 256 / (dh - 1), y0 = fy >> 8, wy = fy & 255, y1 = y0 + 1 < ih ? y0 + 1 : y0;
+            const uint8_t *r0 = img + (size_t)y0 * iw, *r1 = img + (size_t)y1 * iw;
             uint32_t *drow = C->px + (oy + y) * C->stride + ox;
             for (int x = 0; x < dw; x++) {
-                int v = srow[x * iw / dw];
+                int x0 = fx[x] >> 8, wx = fx[x] & 255, x1 = x0 + 1 < iw ? x0 + 1 : x0;
+                int top = r0[x0] * (256 - wx) + r0[x1] * wx, bot = r1[x0] * (256 - wx) + r1[x1] * wx;
+                int v = (top * (256 - wy) + bot * wy) >> 16;
                 drow[x] = ir_thermal ? thermal(v) : COL(v, v, v);
             }
         }
-        for (int i = 0; i < iw * ih; i++) {
-            int v = img[i];
-            sum += v;
-            if (v > maxv) maxv = v;
-            if (v > 235) bright++;
-        }
+        for (int y = 0; y < ih; y++)
+            for (int x = 0; x < iw; x++) {
+                int v = img[y * iw + x];
+                sum += v;
+                if (v > maxv) maxv = v;
+                if (v > 235) { bright++; bx += x; by += y; }
+            }
     } else {
         gfx_fill(C, ox, oy, dw, dh, BLACKISH);
-        txt(&FONT_M, "no IR image", ox + dw / 2, oy + dh / 2 - 14, DIM, A_C);
-        txt(&FONT_S, "Detach the right Joy-Con and hold it (wireless)", ox + dw / 2, oy + dh / 2 + 16, DIM, A_C);
+        float p = 0.5f + 0.5f * sinf((float)t * 3);
+        gfx_ring(C, ox + dw / 2, oy + dh / 2 - 40, 34 + p * 8, 30 + p * 8, gfx_lerp(PANEL, CYAN, 1 - p));
+        txt(&FONT_M, "no IR image yet", ox + dw / 2, oy + dh / 2 + 20, DIM, A_C);
+        txt(&FONT_S, "Works attached (handheld) or detached (wireless).", ox + dw / 2, oy + dh / 2 + 52, DIM, A_C);
+        txt(&FONT_S, "Detached: press any button on the Joy-Cons first.", ox + dw / 2, oy + dh / 2 + 76, DIM, A_C);
+    }
+    int npx = iw * ih;
+    bool hit = img && bright >= 3 && bright < npx / 40;
+    bool flood = img && bright >= npx / 40;
+    if (hit) {  // target lock on the IR source
+        float cx = ox + ((float)bx / bright + 0.5f) * dw / iw, cy = oy + ((float)by / bright + 0.5f) * dh / ih;
+        float p = 0.5f + 0.5f * sinf((float)t * 10);
+        gfx_ring(C, cx, cy, 30 + p * 6, 26 + p * 6, RED);
+        gfx_line(C, cx - 48, cy, cx - 20, cy, 3, RED);
+        gfx_line(C, cx + 20, cy, cx + 48, cy, 3, RED);
+        gfx_line(C, cx, cy - 48, cx, cy - 20, 3, RED);
+        gfx_line(C, cx, cy + 20, cx, cy + 48, 3, RED);
+        int lx = cx + 40 > ox + dw - 120 ? (int)cx - 150 : (int)cx + 40;
+        int ly = cy - 70 < oy ? (int)cy + 40 : (int)cy - 70;
+        gfx_rrect(C, lx, ly, 110, 26, 6, RED);
+        txt(&FONT_S, "IR SOURCE", lx + 55, ly + 13, WHITE, A_C);
     }
     Rect mode = {ox, oy + dh + 10, 200, 40};
     gfx_rrect(C, mode.x, mode.y, mode.w, mode.h, 8, PANEL2);
     txt(&FONT_S, ir_thermal ? "THERMAL view [Y]" : "GRAY view [Y]", mode.x + 100, mode.y + 20, FG, A_C);
     hit_add(mode, HT_IRMODE, 0, 0);
+    Rect fast = {ox + 212, oy + dh + 10, 220, 40};
+    gfx_rrect(C, fast.x, fast.y, fast.w, fast.h, 8, ir_fast ? COL(20, 70, 45) : PANEL2);
+    txt(&FONT_S, ir_fast ? "FAST 80x60 [X]" : "SHARP 160x120 [X]", fast.x + 110, fast.y + 20, ir_fast ? GREEN : FG, A_C);
+    hit_add(fast, HT_IRFAST, 0, 0);
     gfx_rrect(C, 690, 70, 574, 576, 12, PANEL);
     txt(&FONT_B, "JOY-CON IR CAMERA", 708, 84, FG, A_TL);
     txt(&FONT_S, status[0] ? status : "starting...", 708, 118, img ? GREEN : AMBER, A_TL);
     char buf[96];
     if (img) {
-        snprintf(buf, sizeof(buf), "max %d   mean %ld   hot px %d", maxv, (iw * ih) > 0 ? sum / (iw * ih) : 0L, bright);
+        snprintf(buf, sizeof(buf), "max %d   mean %ld   hot px %d", maxv, npx > 0 ? sum / npx : 0L, bright);
         txt(&FONT_M, buf, 708, 152, FG, A_TL);
-        // a source = a small saturated spot (remote LED, face-unlock emitter); a big bright
-        // area is just the Joy-Con's own flood light bouncing off something close
-        int npx = iw * ih;
-        bool hit = bright >= 3 && bright < npx / 40;
-        bool flood = bright >= npx / 40;
-        gfx_rrect(C, 708, 190, 538, 60, 10, hit ? RED : PANEL2);
-        txt(&FONT_B, hit ? "IR SOURCE DETECTED" : flood ? "too close: flood-light glare" : "no strong IR source", 977, 220,
-            hit ? WHITE : flood ? AMBER : DIM, A_C);
     }
+    // a source = a small saturated spot (remote LED, face-unlock emitter); a big bright
+    // area is just the Joy-Con's own flood light bouncing off something close
+    gfx_rrect(C, 708, 190, 538, 60, 10, hit ? RED : PANEL2);
+    txt(&FONT_B, hit ? "IR SOURCE DETECTED" : flood ? "too close: flood-light glare" : "no strong IR source", 977, 220,
+        hit ? WHITE : flood ? AMBER : DIM, A_C);
     static const char *tips[] = {"Camera = black window at the BOTTOM tip of", "the right Joy-Con. Aim that edge at:",
-                                 "", " - a TV remote while pressing a button",
-                                 " - a phone's Face ID / face-unlock emitter", " - CCTV cameras (IR night-vision LEDs)",
-                                 " - the sensor bar of a smart TV", "", "Humans can't see 850-940 nm IR,",
+                                 " - a TV remote while pressing a button",
+                                 " - a phone's face-unlock emitter",
+                                 " - CCTV cameras (IR night-vision LEDs)",
+                                 "Detached Joy-Con? Use FAST [X] for more fps.", "",
+                                 "Humans can't see 850-940 nm IR,",
                                  "the Joy-Con can. Same trick spots hidden", "cameras in hotel rooms."};
-    for (unsigned i = 0; i < sizeof(tips) / sizeof(tips[0]); i++) txt(&FONT_S, tips[i], 708, 276 + (int)i * 26, i >= 8 ? AMBER : DIM, A_TL);
+    for (unsigned i = 0; i < sizeof(tips) / sizeof(tips[0]); i++)
+        txt(&FONT_S, tips[i], 708, 276 + (int)i * 26, i >= 7 ? AMBER : (i == 5 ? CYAN : DIM), A_TL);
 }
 
 static void draw_ecu(double t) {
@@ -2103,7 +2135,7 @@ static void draw_footer(void) {
     else if (tab == TAB_ECU && tko_on) hint = "TAKEOVER: L-stick gas | ZL brake | R-stick steer | Up/Dn gear | </> blink | Y hazard | A horn | B stop";
     else if (tab == TAB_ECU) hint = "Up/Dn ECU | A ping | Y read VIN+date | X reset | ZR power | B TAKEOVER | ZL restore | + arm";
     else if (tab == TAB_NFC) hint = "Tap a tag on the right Joy-Con stick | B clear history | L/R tabs | - help";
-    else hint = "Point the right Joy-Con at IR sources | Y thermal/gray | L/R tabs | - help";
+    else hint = "Aim the bottom tip of the right Joy-Con | Y thermal/gray | X fast/sharp | L/R tabs | - help";
     txt(&FONT_S, hint, 16, H - 27, attract_on ? AMBER : DIM, A_TL);
     txt(&FONT_XS, "v" APP_VERSION_STR, W - 14, H - 25, LINE, A_TR);
 }

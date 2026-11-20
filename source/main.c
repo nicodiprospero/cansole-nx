@@ -619,12 +619,61 @@ void plat_nfc_info(NfcInfo *out) {
 }
 
 // ======================================================================== IR
-static bool ir_inited, ir_running;
+// Follows the right Joy-Con: the handheld rail when attached, the wireless player-1 Joy-Con when
+// detached. Re-acquires the camera by itself when the Joy-Con is attached/detached mid-session,
+// and restarts the processor if frames stop.
+static bool ir_inited, ir_running, ir_wireless, ir_fast, ir_have_frame;
 static IrsIrCameraHandle ir_handle;
+static HidNpadIdType ir_id;
 static u8 *ir_buf;
+static int ir_w = 160, ir_h = 120;
+static u64 ir_retry_tick, ir_last_new_tick, ir_last_sample, ir_fps_tick;
+static int ir_fps, ir_fps_n;
 static char ir_status[96] = "";
-#define IR_W 160  // 160x120 streams ~4x faster than the full 320x240
-#define IR_H 120
+
+static bool ir_find_joycon(HidNpadIdType *out, bool *wireless) {
+    if (hidGetNpadStyleSet(HidNpadIdType_Handheld) & HidNpadStyleTag_NpadHandheld) {
+        *out = HidNpadIdType_Handheld;
+        *wireless = false;
+        return true;
+    }
+    static const HidNpadIdType ids[4] = {HidNpadIdType_No1, HidNpadIdType_No2, HidNpadIdType_No3, HidNpadIdType_No4};
+    for (int i = 0; i < 4; i++) {
+        if (hidGetNpadStyleSet(ids[i]) & (HidNpadStyleTag_NpadJoyDual | HidNpadStyleTag_NpadJoyRight)) {
+            *out = ids[i];
+            *wireless = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ir_stop(void) {
+    if (ir_running) irsStopImageProcessor(ir_handle);
+    ir_running = false;
+    ir_have_frame = false;
+}
+
+static void ir_start(HidNpadIdType id, bool wireless) {
+    Result rc = irsGetIrCameraHandle(&ir_handle, id);
+    if (R_SUCCEEDED(rc)) {
+        IrsImageTransferProcessorConfig cfg;
+        irsGetDefaultImageTransferProcessorConfig(&cfg);
+        cfg.format = ir_fast ? IrsImageTransferProcessorFormat_80x60 : IrsImageTransferProcessorFormat_160x120;
+        ir_w = ir_fast ? 80 : 160;
+        ir_h = ir_fast ? 60 : 120;
+        rc = irsRunImageTransferProcessor(ir_handle, &cfg, 0x100000);
+    }
+    ir_running = R_SUCCEEDED(rc);
+    ir_id = id;
+    ir_wireless = wireless;
+    ir_have_frame = false;
+    ir_last_sample = 0;
+    ir_last_new_tick = armGetSystemTick();
+    plat_log("ir: start id=%d wireless=%d %dx%d rc=0x%X", (int)id, wireless, ir_w, ir_h, (unsigned)rc);
+    if (!ir_running)
+        snprintf(ir_status, sizeof(ir_status), "IR start failed (0x%X) - retrying", (unsigned)rc);
+}
 
 void plat_ir_enable(bool on) {
     if (on && g_safe_mode) {
@@ -639,37 +688,89 @@ void plat_ir_enable(bool on) {
             return;
         }
         ir_inited = true;
-        if (!ir_buf) ir_buf = malloc(IR_W * IR_H);
-        HidNpadIdType id = padIsHandheld(&g_pad) ? HidNpadIdType_Handheld : HidNpadIdType_No1;
-        rc = irsGetIrCameraHandle(&ir_handle, id);
-        if (R_SUCCEEDED(rc)) {
-            IrsImageTransferProcessorConfig cfg;
-            irsGetDefaultImageTransferProcessorConfig(&cfg);
-            cfg.format = IrsImageTransferProcessorFormat_160x120;
-            rc = irsRunImageTransferProcessor(ir_handle, &cfg, 0x100000);
-        }
-        ir_running = R_SUCCEEDED(rc);
-        plat_log("ir start rc=0x%X running=%d", (unsigned)rc, ir_running);
-        if (ir_running)
-            snprintf(ir_status, sizeof(ir_status), "IR camera running (%s)", id == HidNpadIdType_Handheld ? "handheld" : "player 1");
-        else
-            snprintf(ir_status, sizeof(ir_status), "IR start failed (0x%X) - try a detached Joy-Con", (unsigned)rc);
+        if (!ir_buf) ir_buf = malloc(160 * 120);
+        ir_retry_tick = 0;
+        snprintf(ir_status, sizeof(ir_status), "looking for the right Joy-Con...");
     } else if (!on && ir_inited) {
         plat_log("ir: stop (running=%d)", ir_running);
-        if (ir_running) irsStopImageProcessor(ir_handle);
+        ir_stop();
         irsExit();
+        ir_inited = false;
         plat_log("ir: exited");
-        ir_inited = ir_running = false;
+    }
+}
+
+void plat_ir_set_fast(bool fast) {
+    if (fast == ir_fast) return;
+    ir_fast = fast;
+    if (ir_running) {
+        ir_stop();
+        ir_retry_tick = 0;
     }
 }
 
 const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len) {
-    snprintf(status, (size_t)status_len, "%s", ir_status);
-    if (!ir_running || !ir_buf) return NULL;
+    if (!ir_inited || !ir_buf) {
+        snprintf(status, (size_t)status_len, "%s", ir_status);
+        return NULL;
+    }
+    u64 now = armGetSystemTick();
+    HidNpadIdType id;
+    bool wl = false;
+    if (!ir_find_joycon(&id, &wl)) {
+        if (ir_running) {
+            plat_log("ir: right Joy-Con gone");
+            ir_stop();
+        }
+        snprintf(status, (size_t)status_len, "No right Joy-Con: attach it, or press a button on it");
+        return NULL;
+    }
+    if (ir_running && id != ir_id) {
+        plat_log("ir: controller moved %d -> %d", (int)ir_id, (int)id);
+        ir_stop();
+        ir_retry_tick = 0;
+    }
+    if (!ir_running) {
+        if (!ir_retry_tick || armTicksToNs(now - ir_retry_tick) > 1000000000ULL) {
+            ir_retry_tick = now;
+            ir_start(id, wl);
+        }
+        if (!ir_running) {
+            snprintf(status, (size_t)status_len, "%s", ir_status);
+            return NULL;
+        }
+    }
     IrsImageTransferProcessorState st;
-    if (R_FAILED(irsGetImageTransferProcessorState(ir_handle, ir_buf, IR_W * IR_H, &st))) return NULL;
-    *w = IR_W;
-    *h = IR_H;
+    memset(&st, 0, sizeof(st));
+    Result rc = irsGetImageTransferProcessorState(ir_handle, ir_buf, (size_t)(ir_w * ir_h), &st);
+    if (R_SUCCEEDED(rc) && st.sampling_number != ir_last_sample) {
+        ir_last_sample = st.sampling_number;
+        ir_last_new_tick = now;
+        ir_have_frame = true;
+        ir_fps_n++;
+    }
+    if (armTicksToNs(now - ir_fps_tick) > 1000000000ULL) {
+        ir_fps = ir_fps_n;
+        ir_fps_n = 0;
+        ir_fps_tick = now;
+    }
+    // no new image for a while -> restart the processor (Joy-Con went to sleep, BT hiccup...)
+    u64 limit = ir_wireless ? 6000000000ULL : 3000000000ULL;
+    if (armTicksToNs(now - ir_last_new_tick) > limit) {
+        plat_log("ir: no new frame for %llus (rc=0x%X) - restarting", (unsigned long long)(limit / 1000000000ULL), (unsigned)rc);
+        ir_stop();
+        ir_retry_tick = 0;
+        snprintf(status, (size_t)status_len, "IR stalled - restarting...");
+        return NULL;
+    }
+    if (!ir_have_frame) {
+        snprintf(status, (size_t)status_len, "IR starting on %s...", wl ? "wireless Joy-Con" : "handheld rail");
+        return NULL;
+    }
+    snprintf(status, (size_t)status_len, "IR live: %s  %dx%d  %d fps", ir_wireless ? "wireless Joy-Con" : "handheld",
+             ir_w, ir_h, ir_fps);
+    *w = ir_w;
+    *h = ir_h;
     return ir_buf;
 }
 

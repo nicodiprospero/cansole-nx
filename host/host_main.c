@@ -161,6 +161,7 @@ void plat_nfc_info(NfcInfo *o) {
 }
 static bool ir_on; static uint8_t irimg[320 * 240];
 void plat_ir_enable(bool on) { ir_on = on; }
+void plat_ir_set_fast(bool fast) { (void)fast; }
 const uint8_t *plat_ir_frame(int *w, int *h, char *st, int n) {
     if (!ir_on) return NULL;
     for (int y = 0; y < 240; y++) for (int x = 0; x < 320; x++) {
@@ -255,9 +256,12 @@ int main(void) {
         {58.7, 0, 0.0f, 0, NULL},
         {59.5, 0, 0.0f, 0, "12_unplugged"},
         {59.6, 0, 0.0f, 0, NULL},
+        {59.7, 0x80000000u | 5, 0.0f, 0, NULL}, {59.8, 0, 0.0f, 0, NULL},   // touch tab 5 (IR)
+        {60.5, 0, 0.0f, 0, "17_ir_cam"},
+        {60.6, 0, 0.0f, 0, NULL},
     };
     int ns = sizeof S / sizeof S[0], si = 0, last_si = -1;
-    for (T = 0; T < 59.7; T += 1.0 / 60) {
+    for (T = 0; T < 60.7; T += 1.0 / 60) {
         while (si + 1 < ns && S[si + 1].at <= T) si++;
         usb_state_v = S[si].usb ? USB_CONNECTED : USB_SEARCHING;
         snprintf(usb_label, sizeof usb_label, S[si].usb ? "USB 0483:5740 slcan 500k" : "USB: none");
