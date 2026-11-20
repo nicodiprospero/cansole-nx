@@ -199,6 +199,10 @@ static uint32_t mac_fail_total;
 // real bus
 static bool ramn_mode;
 static bool own_tx;            // true while ingesting a frame we transmitted ourselves
+static bool from_net;          // true while ingesting a frame that came from the Wi-Fi bridge
+static unsigned net_to_bus, net_blocked, net_to_sim;
+static int log_scroll;         // SYSTEM tab: lines scrolled up from the newest
+static void net_toggle(double t);
 static int nids;
 static Rate rx_rate, ctr_rate;
 static int ctr_last = -1;
@@ -222,6 +226,7 @@ static void bus_reset(void) {
 static bool src_is_sim(void);
 static void uds_on_frame(const CanFrame *f, double t);
 static void ingest(const CanFrame *f, double t) {
+    if (!from_net) plat_net_send(f);
     IdInfo *e = find_id(f->id);
     if (!e) {
         if (nids >= MAXIDS) return;
@@ -293,8 +298,11 @@ static void ingest(const CanFrame *f, double t) {
 
 // ----------------------------------------------------------------- app state
 enum { SRC_SIM, SRC_USB };
-enum { TAB_CLUSTER, TAB_SNIFF, TAB_IDS, TAB_ECU, TAB_NFC, TAB_IR, NTABS };
-static const char *TAB_NAMES[NTABS] = {"CLUSTER", "SNIFFER", "IDS", "ECU", "NFC", "IR CAM"};
+enum { TAB_CLUSTER, TAB_SNIFF, TAB_IDS, TAB_ECU, TAB_NFC, TAB_IR, TAB_SYS, NTABS };
+static const char *TAB_NAMES[NTABS] = {"CLUSTER", "SNIFFER", "IDS", "ECU", "NFC", "IR CAM", "SYSTEM"};
+#define TAB_X0 172
+#define TAB_STEP 94
+#define TAB_W 90
 
 static int src = SRC_SIM;
 static bool src_is_sim(void) { return src == SRC_SIM; }
@@ -824,7 +832,7 @@ static void gauge_draw(Canvas *c, Gauge *g, float value, bool alive) {
 }
 
 // ---------------------------------------------------------------- touch map
-enum { HT_TAB, HT_QUIT, HT_HELP, HT_RESET, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE, HT_IRFAST, HT_ECU };
+enum { HT_TAB, HT_QUIT, HT_HELP, HT_RESET, HT_HOLD, HT_TAP, HT_ROW, HT_BYTE, HT_IRMODE, HT_IRFAST, HT_ECU, HT_NET, HT_LOGUP, HT_LOGDN };
 typedef struct { Rect r; int type; uint32_t a, b; } Hit;
 static Hit hits[96];
 static int nhits;
@@ -840,7 +848,8 @@ static NfcHist nfc_hist[10];
 static int n_nfc_hist;
 static bool nfc_enabled, ir_enabled;
 static bool ir_thermal = true;
-static bool ir_fast;
+static int ir_mode;  // 0 SHARP, 1 FAST, 2 TRACK
+static const char *IR_MODE_NAMES[3] = {"SHARP 160x120", "FAST 80x60", "TRACK blobs"};
 
 // ---------------------------------------------------------------- logging
 static void toggle_log(double t) {
@@ -982,7 +991,17 @@ static void press(uint32_t b, double t) {
         if (b == B_B) n_nfc_hist = 0;
     } else if (tab == TAB_IR) {
         if (b == B_Y || b == B_A) ir_thermal = !ir_thermal;
-        else if (b == B_X) { ir_fast = !ir_fast; plat_ir_set_fast(ir_fast); toast(t, ir_fast ? "IR FAST: 80x60, best for a detached Joy-Con" : "IR SHARP: 160x120"); }
+        else if (b == B_X) {
+            ir_mode = (ir_mode + 1) % 3;
+            plat_ir_set_mode(ir_mode);
+            toast(t, "%s", ir_mode == 0 ? "IR SHARP: 160x120 image" : ir_mode == 1 ? "IR FAST: 80x60 image, best for a detached Joy-Con"
+                                                                    : "IR TRACK: the Joy-Con finds the blobs itself - full speed");
+        }
+    } else if (tab == TAB_SYS) {
+        if (b == B_A) net_toggle(t);
+        else if (b == B_UP) log_scroll += 3;
+        else if (b == B_DOWN) log_scroll = log_scroll > 3 ? log_scroll - 3 : 0;
+        else if (b == B_Y) log_scroll = 0;
     }
 }
 
@@ -1010,7 +1029,10 @@ static void tap(int x, int y, double t) {
             case HT_ROW: sel_id = h->a; have_sel = true; break;
             case HT_BYTE: sel_id = h->a; have_sel = true; byte_cur = (int)h->b; break;
             case HT_IRMODE: ir_thermal = !ir_thermal; break;
-            case HT_IRFAST: ir_fast = !ir_fast; plat_ir_set_fast(ir_fast); break;
+            case HT_IRFAST: ir_mode = (ir_mode + 1) % 3; plat_ir_set_mode(ir_mode); break;
+            case HT_NET: net_toggle(t); break;
+            case HT_LOGUP: log_scroll += 12; break;
+            case HT_LOGDN: log_scroll = log_scroll > 12 ? log_scroll - 12 : 0; break;
             case HT_ECU:
                 ecu_sel = (int)h->a;
                 if (h->b) { press(h->b, t); release(h->b); }
@@ -1321,23 +1343,24 @@ static void draw_header(double t) {
     r = gfx_text(C, &FONT_MID, "sole", r.x + r.w, 12, FG, A_TL);
     gfx_text(C, &FONT_XS, "NX", r.x + r.w + 4, 22, DIM, A_TL);
     for (int i = 0; i < NTABS; i++) {
-        Rect tr = {172 + i * 106, 10, 102, 36};
+        Rect tr = {TAB_X0 + i * TAB_STEP, 10, TAB_W, 36};
         gfx_rrect(C, tr.x, tr.y, tr.w, tr.h, 8, i == tab ? RED : PANEL2);
-        txt(&FONT_B, TAB_NAMES[i], tr.x + tr.w / 2, tr.y + tr.h / 2, i == tab ? WHITE : DIM, A_C);
+        txt(&FONT_M, TAB_NAMES[i], tr.x + tr.w / 2, tr.y + tr.h / 2, i == tab ? WHITE : DIM, A_C);
+        if (i == TAB_SYS && plat_net_on()) gfx_circle(C, tr.x + tr.w - 9, tr.y + 8, 4, GREEN);  // bridge live
         hit_add(tr, HT_TAB, (uint32_t)i, 0);
     }
     char line[96], l2[96];
     if (src == SRC_SIM) snprintf(line, sizeof(line), "SIM car | %s", plat_usb_label());
     else snprintf(line, sizeof(line), "%s%s", ramn_mode ? "RAMN | " : "", plat_usb_label());
-    if ((int)strlen(line) > 32) line[32] = 0;
-    txt(&FONT_S, line, 1124, 8, src == SRC_SIM ? CYAN : GREEN, A_TR);
+    if ((int)strlen(line) > 30) line[30] = 0;
+    txt(&FONT_S, line, 1130, 8, src == SRC_SIM ? CYAN : GREEN, A_TR);
     const char *tx = src == SRC_SIM ? "TX: SIM" : (tx_armed ? "TX ARMED" : "TX LOCKED");
     uint32_t txc = src == SRC_SIM ? AMBER : (tx_armed ? RED : GREEN);
-    snprintf(l2, sizeof(l2), "%d msg/s  %d IDs  ", rate_get(&rx_rate, t), nids);
-    int total = gfx_text_w(&FONT_S, l2) + gfx_text_w(&FONT_S, tx) + (log_fp ? gfx_text_w(&FONT_S, "  REC") : 0);
-    Rect sr = gfx_text(C, &FONT_S, l2, 1124 - total, 32, DIM, A_TL);
+    snprintf(l2, sizeof(l2), "%d msg/s %d IDs ", rate_get(&rx_rate, t), nids);
+    int total = gfx_text_w(&FONT_S, l2) + gfx_text_w(&FONT_S, tx) + (log_fp ? gfx_text_w(&FONT_S, " REC") : 0);
+    Rect sr = gfx_text(C, &FONT_S, l2, 1130 - total, 32, DIM, A_TL);
     sr = gfx_text(C, &FONT_S, tx, sr.x + sr.w, 32, txc, A_TL);
-    if (log_fp) gfx_text(C, &FONT_S, "  REC", sr.x + sr.w, 32, RED, A_TL);
+    if (log_fp) gfx_text(C, &FONT_S, " REC", sr.x + sr.w, 32, RED, A_TL);
     Rect qb = {W - 50, 10, 38, 36}, hb = {W - 96, 10, 38, 36};
     gfx_rrect(C, qb.x, qb.y, qb.w, qb.h, 8, PANEL2);
     txt(&FONT_B, "X", qb.x + 19, qb.y + 18, DIM, A_C);
@@ -1925,7 +1948,113 @@ static uint32_t thermal(int v) {
                st[i][2] + (int)((st[i + 1][2] - st[i][2]) * k));
 }
 
+// shared IR panel bottom: mode buttons
+static void ir_mode_buttons(int ox, int oy) {
+    Rect mode = {ox, oy, 200, 40};
+    gfx_rrect(C, mode.x, mode.y, mode.w, mode.h, 8, PANEL2);
+    txt(&FONT_S, ir_mode == 2 ? "THERMAL colours" : (ir_thermal ? "THERMAL view [Y]" : "GRAY view [Y]"), mode.x + 100, mode.y + 20,
+        ir_mode == 2 ? DIM : FG, A_C);
+    hit_add(mode, HT_IRMODE, 0, 0);
+    Rect fast = {ox + 212, oy, 240, 40};
+    gfx_rrect(C, fast.x, fast.y, fast.w, fast.h, 8, ir_mode ? COL(20, 70, 45) : PANEL2);
+    char b[48];
+    snprintf(b, sizeof(b), "%s [X]", IR_MODE_NAMES[ir_mode]);
+    txt(&FONT_S, b, fast.x + 120, fast.y + 20, ir_mode ? GREEN : FG, A_C);
+    hit_add(fast, HT_IRFAST, 0, 0);
+}
+
+// TRACK mode: the Joy-Con's clustering processor reports blob positions, we draw them + a trail
+static void draw_ir_track(double t) {
+    static IrBlob bl[16];
+    static float trail_x[40], trail_y[40];
+    static int trail_n;
+    static double last_seen;
+    char status[96] = "";
+    int n = plat_ir_blobs(bl, 16, status, sizeof(status));
+    int ox = 24, oy = 76, dw = 640, dh = 480;
+    gfx_fill(C, ox - 4, oy - 4, dw + 8, dh + 8, LINE);
+    gfx_fill(C, ox, oy, dw, dh, COL(6, 8, 12));
+    for (int gx = 1; gx < 8; gx++) gfx_fill(C, ox + gx * dw / 8, oy, 1, dh, COL(20, 26, 36));
+    for (int gy = 1; gy < 6; gy++) gfx_fill(C, ox, oy + gy * dh / 6, dw, 1, COL(20, 26, 36));
+    int best = -1, biggest = 0;
+    float best_score = -1, brightest = 0;
+    for (int i = 0; i < n; i++) {
+        float score = bl[i].intensity * (bl[i].pixels < 2000 ? 2.0f : 1.0f);  // prefer point sources
+        if (score > best_score) { best_score = score; best = i; }
+        if (bl[i].pixels > biggest) biggest = bl[i].pixels;
+        if (bl[i].intensity > brightest) brightest = bl[i].intensity;
+    }
+    if (best >= 0) {
+        float sx = ox + bl[best].x * dw / 320.0f, sy = oy + bl[best].y * dh / 240.0f;
+        if (trail_n == 40) {
+            memmove(trail_x, trail_x + 1, sizeof(float) * 39);
+            memmove(trail_y, trail_y + 1, sizeof(float) * 39);
+            trail_n--;
+        }
+        trail_x[trail_n] = sx;
+        trail_y[trail_n] = sy;
+        trail_n++;
+        last_seen = t;
+    } else if (t - last_seen > 0.6) {
+        trail_n = 0;
+    }
+    for (int i = 1; i < trail_n; i++)
+        gfx_line(C, trail_x[i - 1], trail_y[i - 1], trail_x[i], trail_y[i], 2.0f + 4.0f * i / trail_n,
+                 gfx_lerp(COL(6, 8, 12), CYAN, (float)i / trail_n));
+    for (int i = 0; i < n; i++) {
+        float sx = ox + bl[i].x * dw / 320.0f, sy = oy + bl[i].y * dh / 240.0f;
+        float r = sqrtf((float)bl[i].pixels) * 1.6f;
+        if (r < 6) r = 6;
+        if (r > 90) r = 90;
+        gfx_circle(C, sx, sy, r, thermal((int)bl[i].intensity));
+    }
+    if (best >= 0) {
+        float cx = ox + bl[best].x * dw / 320.0f, cy = oy + bl[best].y * dh / 240.0f;
+        float p = 0.5f + 0.5f * sinf((float)t * 10);
+        gfx_ring(C, cx, cy, 30 + p * 6, 26 + p * 6, RED);
+        gfx_line(C, cx - 48, cy, cx - 20, cy, 3, RED);
+        gfx_line(C, cx + 20, cy, cx + 48, cy, 3, RED);
+        gfx_line(C, cx, cy - 48, cx, cy - 20, 3, RED);
+        gfx_line(C, cx, cy + 20, cx, cy + 48, 3, RED);
+        int lx = cx + 40 > ox + dw - 130 ? (int)cx - 160 : (int)cx + 40;
+        int ly = cy - 70 < oy ? (int)cy + 40 : (int)cy - 70;
+        gfx_rrect(C, lx, ly, 120, 26, 6, RED);
+        txt(&FONT_S, bl[best].pixels < 400 ? "IR SOURCE" : "IR OBJECT", lx + 60, ly + 13, WHITE, A_C);
+    }
+    if (n < 0) {
+        float p = 0.5f + 0.5f * sinf((float)t * 3);
+        gfx_ring(C, ox + dw / 2, oy + dh / 2 - 40, 34 + p * 8, 30 + p * 8, gfx_lerp(PANEL, CYAN, 1 - p));
+        txt(&FONT_M, "waiting for IR data", ox + dw / 2, oy + dh / 2 + 20, DIM, A_C);
+        txt(&FONT_S, "Detached: press any button on the Joy-Cons first.", ox + dw / 2, oy + dh / 2 + 52, DIM, A_C);
+    } else if (n == 0) {
+        txt(&FONT_S, "no bright spots - aim at a TV remote or wave your hand close", ox + dw / 2, oy + dh - 24, DIM, A_C);
+    }
+    ir_mode_buttons(ox, oy + dh + 10);
+    gfx_rrect(C, 690, 70, 574, 576, 12, PANEL);
+    txt(&FONT_B, "JOY-CON IR TRACKER", 708, 84, FG, A_TL);
+    txt(&FONT_S, status[0] ? status : "starting...", 708, 118, n >= 0 ? GREEN : AMBER, A_TL);
+    char buf[96];
+    if (n >= 0) {
+        snprintf(buf, sizeof(buf), "blobs %d   biggest %d px   peak %.0f", n, biggest, brightest);
+        txt(&FONT_M, buf, 708, 152, FG, A_TL);
+    }
+    gfx_rrect(C, 708, 190, 538, 60, 10, n > 0 ? RED : PANEL2);
+    snprintf(buf, sizeof(buf), n > 0 ? "TRACKING %d IR BLOB%s" : "nothing to track", n, n == 1 ? "" : "S");
+    txt(&FONT_B, buf, 977, 220, n > 0 ? WHITE : DIM, A_C);
+    static const char *tips[] = {"TRACK mode: the Joy-Con's own chip finds", "the bright spots and sends only their",
+                                 "positions - full camera rate, even over", "Bluetooth. No image leaves the Joy-Con.",
+                                 "", "Wave a TV remote (button held) and watch", "the trail. Close objects (your hand) light",
+                                 "up from the Joy-Con's IR flood LEDs.", "",
+                                 "Same idea as a Wii sensor bar - and as", "IR tracking in a car's driver monitoring."};
+    for (unsigned i = 0; i < sizeof(tips) / sizeof(tips[0]); i++)
+        txt(&FONT_S, tips[i], 708, 276 + (int)i * 26, i >= 9 ? AMBER : (i < 4 ? CYAN : DIM), A_TL);
+}
+
 static void draw_ir(double t) {
+    if (ir_mode == 2) {
+        draw_ir_track(t);
+        return;
+    }
     char status[96] = "";
     int iw = 0, ih = 0;
     const uint8_t *img = plat_ir_frame(&iw, &ih, status, sizeof(status));
@@ -1979,14 +2108,7 @@ static void draw_ir(double t) {
         gfx_rrect(C, lx, ly, 110, 26, 6, RED);
         txt(&FONT_S, "IR SOURCE", lx + 55, ly + 13, WHITE, A_C);
     }
-    Rect mode = {ox, oy + dh + 10, 200, 40};
-    gfx_rrect(C, mode.x, mode.y, mode.w, mode.h, 8, PANEL2);
-    txt(&FONT_S, ir_thermal ? "THERMAL view [Y]" : "GRAY view [Y]", mode.x + 100, mode.y + 20, FG, A_C);
-    hit_add(mode, HT_IRMODE, 0, 0);
-    Rect fast = {ox + 212, oy + dh + 10, 220, 40};
-    gfx_rrect(C, fast.x, fast.y, fast.w, fast.h, 8, ir_fast ? COL(20, 70, 45) : PANEL2);
-    txt(&FONT_S, ir_fast ? "FAST 80x60 [X]" : "SHARP 160x120 [X]", fast.x + 110, fast.y + 20, ir_fast ? GREEN : FG, A_C);
-    hit_add(fast, HT_IRFAST, 0, 0);
+    ir_mode_buttons(ox, oy + dh + 10);
     gfx_rrect(C, 690, 70, 574, 576, 12, PANEL);
     txt(&FONT_B, "JOY-CON IR CAMERA", 708, 84, FG, A_TL);
     txt(&FONT_S, status[0] ? status : "starting...", 708, 118, img ? GREEN : AMBER, A_TL);
@@ -2004,11 +2126,103 @@ static void draw_ir(double t) {
                                  " - a TV remote while pressing a button",
                                  " - a phone's face-unlock emitter",
                                  " - CCTV cameras (IR night-vision LEDs)",
-                                 "Detached Joy-Con? Use FAST [X] for more fps.", "",
+                                 "X: SHARP -> FAST -> TRACK (full speed).", "",
                                  "Humans can't see 850-940 nm IR,",
                                  "the Joy-Con can. Same trick spots hidden", "cameras in hotel rooms."};
     for (unsigned i = 0; i < sizeof(tips) / sizeof(tips[0]); i++)
         txt(&FONT_S, tips[i], 708, 276 + (int)i * 26, i >= 7 ? AMBER : (i == 5 ? CYAN : DIM), A_TL);
+}
+
+// ---------------------------------------------------------------- SYSTEM: Wi-Fi bridge + log
+static void net_toggle(double t) {
+    plat_net_enable(!plat_net_on());
+    char a[64], b2[64];
+    unsigned tx, rx;
+    plat_net_info(a, sizeof(a), b2, sizeof(b2), &tx, &rx);
+    if (plat_net_on()) toast(t, "Wi-Fi CAN bridge ON at %s", a);
+    else toast(t, "Wi-Fi CAN bridge off%s%s", strcmp(a, "off") ? ": " : "", strcmp(a, "off") ? a : "");
+}
+
+static void draw_sys(double t) {
+    (void)t;
+    char l1[64], l2[64], buf[128];
+    unsigned ntx, nrx;
+    bool on = plat_net_on();
+    plat_net_info(l1, sizeof(l1), l2, sizeof(l2), &ntx, &nrx);
+    // ---- left: bridge
+    gfx_rrect(C, 12, 70, 640, 576, 12, PANEL);
+    txt(&FONT_B, "WI-FI CAN BRIDGE", 30, 84, FG, A_TL);
+    txt(&FONT_XS, "cannelloni over UDP: a laptop sees the Switch as a SocketCAN interface", 30, 112, DIM, A_TL);
+    Rect btn = {30, 138, 604, 60};
+    gfx_rrect(C, btn.x, btn.y, btn.w, btn.h, 10, on ? COL(20, 90, 55) : RED);
+    txt(&FONT_B, on ? "BRIDGE ON - tap or A to stop" : "START BRIDGE [A]", btn.x + btn.w / 2, btn.y + btn.h / 2, WHITE, A_C);
+    hit_add(btn, HT_NET, 0, 0);
+    if (on) {
+        txt(&FONT_M, "Switch", 30, 214, DIM, A_TL);
+        txt(&FONT_M, l1, 140, 214, GREEN, A_TL);
+        txt(&FONT_M, "Peer", 30, 244, DIM, A_TL);
+        txt(&FONT_M, l2, 140, 244, strncmp(l2, "laptop", 6) ? AMBER : GREEN, A_TL);
+        snprintf(buf, sizeof(buf), "out %u frames   in %u", ntx, nrx);
+        txt(&FONT_M, buf, 30, 274, FG, A_TL);
+        snprintf(buf, sizeof(buf), "in -> bus %u   blocked (TX locked) %u   -> sim %u", net_to_bus, net_blocked, net_to_sim);
+        txt(&FONT_XS, buf, 30, 302, net_blocked ? AMBER : DIM, A_TL);
+    } else {
+        txt(&FONT_M, l1, 30, 214, strcmp(l1, "off") ? AMBER : DIM, A_TL);
+        txt(&FONT_S, "Needs the Switch on Wi-Fi (a phone hotspot works).", 30, 246, DIM, A_TL);
+    }
+    char ipbuf[64] = "<switch-ip>";
+    if (on) {
+        snprintf(ipbuf, sizeof(ipbuf), "%s", l1);
+        char *c = strchr(ipbuf, ':');
+        if (c) *c = 0;
+    }
+    const char *steps[] = {"On a Linux laptop on the same Wi-Fi:", " sudo modprobe vcan",
+                           " sudo ip link add vcan0 type vcan && sudo ip link set up vcan0", NULL,
+                           " candump vcan0   (or Wireshark / SavvyCAN on vcan0)", "", "Send from the laptop:",
+                           " cansend vcan0 1A0#5DC00000   -> virtual car shows 240 km/h",
+                           "Laptop frames reach the RAMN bus only while TX ARMED."};
+    for (int i = 0; i < 9; i++) {
+        const char *ln = steps[i];
+        if (!ln) {
+            snprintf(buf, sizeof(buf), " cannelloni -I vcan0 -R %s -r 20000 -l 20000", ipbuf);
+            ln = buf;
+        }
+        txt(&FONT_XS, ln, 30, 336 + i * 24, i == 0 || i == 6 ? FG : (i == 8 ? AMBER : CYAN), A_TL);
+    }
+    // ---- right: log
+    gfx_rrect(C, 664, 70, 600, 576, 12, PANEL);
+    txt(&FONT_B, "LOG", 682, 84, FG, A_TL);
+    int pc = plat_prev_session_clean();
+    const char *pmsg = pc < 0 ? "first run" : pc ? "last session: CLEAN EXIT" : "last session: NO CLEAN EXIT";
+    Rect pb = {760, 80, 320, 28};
+    gfx_rrect(C, pb.x, pb.y, pb.w, pb.h, 6, pc == 0 ? RED : pc == 1 ? COL(20, 90, 55) : PANEL2);
+    txt(&FONT_S, pmsg, pb.x + pb.w / 2, pb.y + pb.h / 2, WHITE, A_C);
+    Rect up = {1092, 80, 76, 28}, dn = {1176, 80, 76, 28};
+    gfx_rrect(C, up.x, up.y, up.w, up.h, 6, PANEL2);
+    txt(&FONT_S, "UP", up.x + up.w / 2, up.y + up.h / 2, FG, A_C);
+    hit_add(up, HT_LOGUP, 0, 0);
+    gfx_rrect(C, dn.x, dn.y, dn.w, dn.h, 6, PANEL2);
+    txt(&FONT_S, "DOWN", dn.x + dn.w / 2, dn.y + dn.h / 2, FG, A_C);
+    hit_add(dn, HT_LOGDN, 0, 0);
+    int n = plat_log_count(), vis = 27;
+    int maxscroll = n > vis ? n - vis : 0;
+    if (log_scroll > maxscroll) log_scroll = maxscroll;
+    int first = n - vis - log_scroll;
+    if (first < 0) first = 0;
+    for (int i = 0; i < vis && first + i < n; i++) {
+        const char *ln = plat_log_line(first + i);
+        char tmp[80];
+        snprintf(tmp, sizeof(tmp), "%.71s", ln);
+        bool prev = !strncmp(ln, "prev ", 5);
+        uint32_t col = prev ? DIM : FG;
+        if (strstr(ln, "clean exit") || strstr(ln, "CLEAN EXIT")) col = GREEN;
+        if (strstr(ln, "fail") || strstr(ln, "NO clean") || strstr(ln, "stalled") || strstr(ln, "errno")) col = AMBER;
+        txt(&FONT_XS, tmp, 680, 120 + i * 19, col, A_TL);
+    }
+    if (log_scroll) {
+        snprintf(buf, sizeof(buf), "scrolled up %d lines - Y for newest", log_scroll);
+        txt(&FONT_XS, buf, 1250, 628, AMBER, A_TR);
+    }
 }
 
 static void draw_ecu(double t) {
@@ -2135,7 +2349,8 @@ static void draw_footer(void) {
     else if (tab == TAB_ECU && tko_on) hint = "TAKEOVER: L-stick gas | ZL brake | R-stick steer | Up/Dn gear | </> blink | Y hazard | A horn | B stop";
     else if (tab == TAB_ECU) hint = "Up/Dn ECU | A ping | Y read VIN+date | X reset | ZR power | B TAKEOVER | ZL restore | + arm";
     else if (tab == TAB_NFC) hint = "Tap a tag on the right Joy-Con stick | B clear history | L/R tabs | - help";
-    else hint = "Aim the bottom tip of the right Joy-Con | Y thermal/gray | X fast/sharp | L/R tabs | - help";
+    else if (tab == TAB_IR) hint = "Aim the bottom tip of the right Joy-Con | Y thermal/gray | X sharp/fast/track | L/R tabs | - help";
+    else hint = "A Wi-Fi CAN bridge on/off | Up/Down scroll log | Y newest | L/R tabs | - help";
     txt(&FONT_S, hint, 16, H - 27, attract_on ? AMBER : DIM, A_TL);
     txt(&FONT_XS, "v" APP_VERSION_STR, W - 14, H - 25, LINE, A_TR);
 }
@@ -2246,6 +2461,11 @@ static void switch_source(int s, double t) {
 }
 
 bool app_frame(Canvas *c, const Input *in, double t) {
+    static bool first_frame = true;
+    if (first_frame) {
+        first_frame = false;
+        if (plat_prev_session_clean() == 0) toast(t, "Last session didn't exit cleanly - see the SYSTEM tab log");
+    }
     C = c;
     now_t = t;
     float dt = last_t < 0 ? 0.016f : (float)(t - last_t);
@@ -2303,6 +2523,27 @@ bool app_frame(Canvas *c, const Input *in, double t) {
         int n, guard = 0;
         while ((n = plat_usb_poll(fr, 256)) > 0 && guard++ < 16)
             for (int i = 0; i < n; i++) ingest(&fr[i], t);
+    }
+    {   // Wi-Fi bridge: frames from the laptop go to the simulator, or to the real bus only when armed
+        CanFrame nf[64];
+        int nn = plat_net_poll(nf, 64);
+        for (int i = 0; i < nn; i++) {
+            if (src == SRC_SIM) {
+                from_net = true;
+                ingest(&nf[i], t);
+                from_net = false;
+                net_to_sim++;
+            } else if (tx_armed && plat_usb_send(&nf[i])) {
+                from_net = true;
+                own_tx = true;
+                ingest(&nf[i], t);
+                own_tx = false;
+                from_net = false;
+                net_to_bus++;
+            } else {
+                net_blocked++;
+            }
+        }
     }
     if (tko_on) {
         float g = in->stick_y > 0.08f ? in->stick_y : 0;
@@ -2373,6 +2614,7 @@ bool app_frame(Canvas *c, const Input *in, double t) {
         case TAB_ECU: draw_ecu(t); break;
         case TAB_NFC: draw_nfc(t); break;
         case TAB_IR: draw_ir(t); break;
+        case TAB_SYS: draw_sys(t); break;
     }
     draw_footer();
     if (show_help) draw_help();

@@ -36,13 +36,30 @@ void plat_nfc_info(NfcInfo *out);
 
 // ---- Joy-Con IR camera
 void plat_ir_enable(bool on);
-void plat_ir_set_fast(bool fast);  // 80x60 instead of 160x120 (faster over Bluetooth)
+void plat_ir_set_mode(int mode);  // 0 SHARP 160x120 image, 1 FAST 80x60 image, 2 TRACK (blob clustering)
 const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len);  // 8-bit grayscale or NULL
+typedef struct {
+    float x, y;        // centroid in the 320x240 sensor space
+    int pixels;        // blob size
+    float intensity;   // average brightness 0-255
+    int bx, by, bw, bh;
+} IrBlob;
+int plat_ir_blobs(IrBlob *out, int max, char *status, int status_len);  // TRACK mode: blob count, -1 = no data
 
 // ---- files / diagnostics
 const char *plat_data_dir(void);  // folder for candump logs, with trailing slash
 void plat_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));  // boot.log on SD
 bool plat_safe_mode(void);        // true if launched holding ZL: USB/NFC/IR disabled
+int plat_log_count(void);         // in-memory log ring (this session + tail of the previous one)
+const char *plat_log_line(int i); // 0 = oldest
+int plat_prev_session_clean(void);  // -1 unknown, 0 previous session did not exit cleanly, 1 clean
+
+// ---- Wi-Fi CAN bridge (cannelloni over UDP :20000 - a Linux laptop sees a SocketCAN interface)
+void plat_net_enable(bool on);
+bool plat_net_on(void);
+void plat_net_send(const CanFrame *f);      // queued, sent once per frame
+int plat_net_poll(CanFrame *out, int max);  // flushes the queue, returns frames received from the laptop
+void plat_net_info(char *line1, int n1, char *line2, int n2, unsigned *tx, unsigned *rx);
 
 // ---- haptics
 void plat_rumble(float amp, int ms);  // Joy-Con HD rumble pulse (amp 0..1)

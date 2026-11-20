@@ -11,7 +11,7 @@
 
 static double T;
 static int usb_state_v = USB_SEARCHING;
-static char usb_label[64] = "USB: none";
+static char usb_label[64] = "plug RAMN/CANable";
 static int usb_tx_mode;  // 0 listen-only, 1 normal
 int plat_usb_state(void) { return usb_state_v; }
 const char *plat_usb_label(void) { return usb_label; }
@@ -26,7 +26,7 @@ bool plat_usb_raw(const char *cmd) {
     return true;
 }
 void plat_usb_set_tx(bool en) { usb_tx_mode = en; fprintf(stderr, "[usb] adapter mode %s\n", en ? "O (normal)" : "L (listen-only)"); }
-void plat_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); fprintf(stderr, "[log] "); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap); }
+
 bool plat_safe_mode(void) { return false; }
 static int rumbles;
 void plat_rumble(float amp, int ms) { rumbles++; }
@@ -161,7 +161,44 @@ void plat_nfc_info(NfcInfo *o) {
 }
 static bool ir_on; static uint8_t irimg[320 * 240];
 void plat_ir_enable(bool on) { ir_on = on; }
-void plat_ir_set_fast(bool fast) { (void)fast; }
+static int host_ir_mode;
+void plat_ir_set_mode(int mode) { host_ir_mode = mode; }
+int plat_ir_blobs(IrBlob *out, int max, char *st, int n) {
+    if (!ir_on || host_ir_mode != 2) return -1;
+    static double ph = 0;
+    ph += 0.05;
+    int k = 0;
+    if (k < max) { out[k] = (IrBlob){160 + 90 * cos(ph), 120 + 60 * sin(ph * 1.3), 40, 250, 0, 0, 0, 0}; k++; }
+    if (k < max) { out[k] = (IrBlob){60, 190, 400, 180, 30, 170, 60, 40}; k++; }
+    snprintf(st, n, "IR TRACK: handheld  %d blobs  60 Hz", k);
+    return k;
+}
+// log ring stub
+static char hlog[64][112]; static int hlog_n;
+void plat_log(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    char m[100]; vsnprintf(m, sizeof m, fmt, ap); va_end(ap);
+    fprintf(stderr, "[log] %s\n", m);
+    if (hlog_n < 64) snprintf(hlog[hlog_n++], 112, "[%8.3f] %s", 0.0, m);
+}
+int plat_log_count(void) { return hlog_n; }
+const char *plat_log_line(int i) { return (i >= 0 && i < hlog_n) ? hlog[i] : ""; }
+int plat_prev_session_clean(void) { return 0; }
+// net stub: pretend a laptop is connected and echo a frame back now and then
+static bool hnet; static unsigned hntx, hnrx;
+void plat_net_enable(bool on) { hnet = on; }
+bool plat_net_on(void) { return hnet; }
+void plat_net_send(const CanFrame *f) { (void)f; if (hnet) hntx++; }
+int plat_net_poll(CanFrame *out, int max) {
+    static int tick; if (!hnet || max < 1) return 0;
+    if (++tick % 30) return 0;
+    memset(out, 0, sizeof *out); out->id = 0x1A0; out->len = 8; out->data[0] = 0x5D; out->data[1] = 0xC0;
+    hnrx++; return 1;
+}
+void plat_net_info(char *l1, int n1, char *l2, int n2, unsigned *tx, unsigned *rx) {
+    snprintf(l1, n1, hnet ? "192.168.43.12:20000" : "off"); snprintf(l2, n2, hnet ? "laptop 192.168.43.20:20000" : "");
+    *tx = hntx; *rx = hnrx;
+}
 const uint8_t *plat_ir_frame(int *w, int *h, char *st, int n) {
     if (!ir_on) return NULL;
     for (int y = 0; y < 240; y++) for (int x = 0; x < 320; x++) {
@@ -258,16 +295,21 @@ int main(void) {
         {59.6, 0, 0.0f, 0, NULL},
         {59.7, 0x80000000u | 5, 0.0f, 0, NULL}, {59.8, 0, 0.0f, 0, NULL},   // touch tab 5 (IR)
         {60.5, 0, 0.0f, 0, "17_ir_cam"},
-        {60.6, 0, 0.0f, 0, NULL},
+        {60.6, B_X, 0.0f, 0, NULL}, {60.7, 0, 0.0f, 0, NULL}, {60.8, B_X, 0.0f, 0, NULL}, {60.9, 0, 0.0f, 0, NULL},
+        {61.8, 0, 0.0f, 0, "18_ir_track"},
+        {61.9, 0x80000000u | 6, 0.0f, 0, NULL}, {62.0, 0, 0.0f, 0, NULL},   // touch tab 6 (SYSTEM)
+        {62.1, B_A, 0.0f, 0, NULL}, {62.2, 0, 0.0f, 0, NULL},
+        {63.5, 0, 0.0f, 0, "19_system"},
+        {63.6, 0, 0.0f, 0, NULL},
     };
     int ns = sizeof S / sizeof S[0], si = 0, last_si = -1;
-    for (T = 0; T < 60.7; T += 1.0 / 60) {
+    for (T = 0; T < 63.7; T += 1.0 / 60) {
         while (si + 1 < ns && S[si + 1].at <= T) si++;
         usb_state_v = S[si].usb ? USB_CONNECTED : USB_SEARCHING;
-        snprintf(usb_label, sizeof usb_label, S[si].usb ? "USB 0483:5740 slcan 500k" : "USB: none");
+        snprintf(usb_label, sizeof usb_label, S[si].usb ? "0483:5740 slcan 500k" : "plug RAMN/CANable");
         uint32_t hb = S[si].held;
         in.touching = false;
-        if (hb & 0x80000000u) { in.touching = true; in.tx = 172 + (int)(hb & 15) * 106 + 51; in.ty = 28; hb = 0; }
+        if (hb & 0x80000000u) { in.touching = true; in.tx = 172 + (int)(hb & 15) * 94 + 45; in.ty = 28; hb = 0; }
         in.held = hb; in.down = in.held & ~prev; in.up = prev & ~in.held; prev = in.held;
         in.stick_y = S[si].stick;
         in.rstick_x = (float)sin(T * 1.5);

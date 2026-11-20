@@ -1,8 +1,15 @@
 // CANsole NX - Nintendo Switch platform layer (libnx)
 //   framebuffer + Joy-Con/touch input, USB-CAN (slcan over CDC-ACM via usb:hs),
 //   Joy-Con NFC (nfc:user) and Joy-Con IR camera (irs).
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <malloc.h>
+#include <netinet/in.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -16,25 +23,74 @@ static bool g_safe_mode;
 static u64 g_t0;
 
 // ================================================================ boot log
+// Every line goes to sdmc:/switch/cansole-nx/boot.log AND to an in-memory ring that the SYSTEM tab
+// shows. At startup the tail of the previous session is loaded too, so a crash/reboot cause is
+// visible on the console itself.
+#define LOG_PATH "sdmc:/switch/cansole-nx/boot.log"
+#define LOG_RING 240
 static Mutex log_mtx;
 static FILE *bootlog;
+static char log_ring[LOG_RING][112];
+static int log_n, log_head;  // count kept, index of the oldest
+static int prev_clean = -1;  // -1 no previous session, 0 ended without "clean exit", 1 clean
+static void ring_push(const char *line) {
+    int idx = (log_head + log_n) % LOG_RING;
+    if (log_n == LOG_RING) log_head = (log_head + 1) % LOG_RING;
+    else log_n++;
+    snprintf(log_ring[idx], sizeof(log_ring[idx]), "%s", line);
+}
 void plat_log(const char *fmt, ...) {
+    char line[112], msg[100];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    snprintf(line, sizeof(line), "[%8.3f] %s", armTicksToNs(armGetSystemTick() - g_t0) / 1e9, msg);
     mutexLock(&log_mtx);
     if (!bootlog) {
         mkdir("sdmc:/switch", 0777);
         mkdir("sdmc:/switch/cansole-nx", 0777);
-        bootlog = fopen("sdmc:/switch/cansole-nx/boot.log", "a");
+        bootlog = fopen(LOG_PATH, "a");
     }
     if (bootlog) {
-        va_list ap;
-        va_start(ap, fmt);
-        fprintf(bootlog, "[%8.3f] ", armTicksToNs(armGetSystemTick() - g_t0) / 1e9);
-        vfprintf(bootlog, fmt, ap);
+        fputs(line, bootlog);
         fputc('\n', bootlog);
         fflush(bootlog);
-        va_end(ap);
     }
+    ring_push(line);
     mutexUnlock(&log_mtx);
+}
+int plat_log_count(void) { return log_n; }
+const char *plat_log_line(int i) {
+    if (i < 0 || i >= log_n) return "";
+    return log_ring[(log_head + i) % LOG_RING];
+}
+int plat_prev_session_clean(void) { return prev_clean; }
+
+// Load the last session's lines (after the final "---- CANsole NX" marker) into the ring.
+static void log_load_previous(void) {
+    FILE *f = fopen(LOG_PATH, "r");
+    if (!f) return;
+    static char tail[48][112];
+    int tn = 0, th = 0;
+    bool seen = false, clean = false;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), f)) {
+        buf[strcspn(buf, "\r\n")] = 0;
+        if (strstr(buf, "---- CANsole NX")) { tn = 0; th = 0; seen = true; clean = false; }
+        if (strstr(buf, "clean exit")) clean = true;
+        int idx = (th + tn) % 48;
+        if (tn == 48) th = (th + 1) % 48;
+        else tn++;
+        snprintf(tail[idx], sizeof(tail[idx]), "prev %s", buf);
+    }
+    long size = ftell(f);
+    fclose(f);
+    if (!seen) return;
+    prev_clean = clean ? 1 : 0;
+    for (int i = 0; i < tn; i++) ring_push(tail[(th + i) % 48]);
+    ring_push(clean ? "prev ===== previous session: CLEAN EXIT =====" : "prev ===== previous session: NO clean exit (last line above) =====");
+    if (size > 256 * 1024) rename(LOG_PATH, "sdmc:/switch/cansole-nx/boot.old.log");  // keep the file small
 }
 bool plat_safe_mode(void) { return g_safe_mode; }
 
@@ -116,9 +172,9 @@ static void set_label(const char *s) {
 static void update_label(void) {
     char lab[64];
     if (usb_kind == KIND_SLCAN)
-        snprintf(lab, sizeof(lab), "USB %04X:%04X slcan %dk%s", usb_vid, usb_pid, BR_KBPS[br_idx], ever_rx ? "" : "?");
+        snprintf(lab, sizeof(lab), "%04X:%04X slcan %dk%s", usb_vid, usb_pid, BR_KBPS[br_idx], ever_rx ? "" : "?");
     else
-        snprintf(lab, sizeof(lab), "USB %04X:%04X gs_usb %dk%s", usb_vid, usb_pid, BR_KBPS[br_idx], ever_rx ? "" : "?");
+        snprintf(lab, sizeof(lab), "%04X:%04X gs_usb %dk%s", usb_vid, usb_pid, BR_KBPS[br_idx], ever_rx ? "" : "?");
     set_label(lab);
 }
 
@@ -302,7 +358,7 @@ static void usb_main(void *arg) {
     while (usb_run) {
         if (!have_if) {
             usb_state_v = USB_SEARCHING;
-            set_label("USB: plug RAMN/CANable");
+            set_label("plug RAMN/CANable");
             if (!try_slcan() && !try_gsusb()) {
                 svcSleepThread(500000000ULL);
                 continue;
@@ -447,7 +503,7 @@ static void usb_start(void) {
     if (R_SUCCEEDED(rc)) usb_hs_up = true;
     if (R_FAILED(rc) || !usb_inbuf || !usb_outbuf || !usb_ctrlbuf) {
         usb_state_v = USB_ERROR;
-        snprintf(usb_label_s, sizeof(usb_label_s), "USB host unavailable (0x%X)", (unsigned)rc);
+        snprintf(usb_label_s, sizeof(usb_label_s), "USB err 0x%X", (unsigned)rc);
         return;
     }
     usb_run = true;
@@ -620,16 +676,22 @@ void plat_nfc_info(NfcInfo *out) {
 
 // ======================================================================== IR
 // Follows the right Joy-Con: the handheld rail when attached, the wireless player-1 Joy-Con when
-// detached. Re-acquires the camera by itself when the Joy-Con is attached/detached mid-session,
-// and restarts the processor if frames stop.
-static bool ir_inited, ir_running, ir_wireless, ir_fast, ir_have_frame;
+// detached. Re-acquires the camera when the Joy-Con is attached/detached mid-session and restarts
+// the processor if data stops.
+// Modes: 0 SHARP image 160x120, 1 FAST image 80x60, 2 TRACK = clustering processor (the Joy-Con
+// finds the bright blobs itself and sends only their positions, so it runs at full camera rate).
+static bool ir_inited, ir_running, ir_wireless, ir_have_data;
+static int ir_mode, ir_run_mode;
 static IrsIrCameraHandle ir_handle;
 static HidNpadIdType ir_id;
 static u8 *ir_buf;
 static int ir_w = 160, ir_h = 120;
-static u64 ir_retry_tick, ir_last_new_tick, ir_last_sample, ir_fps_tick;
+static u64 ir_retry_tick, ir_last_new_tick, ir_fps_tick;
+static s64 ir_last_sample;
 static int ir_fps, ir_fps_n;
 static char ir_status[96] = "";
+static IrBlob ir_blobs[16];
+static int ir_nblobs;
 
 static bool ir_find_joycon(HidNpadIdType *out, bool *wireless) {
     if (hidGetNpadStyleSet(HidNpadIdType_Handheld) & HidNpadStyleTag_NpadHandheld) {
@@ -651,26 +713,46 @@ static bool ir_find_joycon(HidNpadIdType *out, bool *wireless) {
 static void ir_stop(void) {
     if (ir_running) irsStopImageProcessor(ir_handle);
     ir_running = false;
-    ir_have_frame = false;
+    ir_have_data = false;
+    ir_nblobs = 0;
 }
 
 static void ir_start(HidNpadIdType id, bool wireless) {
     Result rc = irsGetIrCameraHandle(&ir_handle, id);
     if (R_SUCCEEDED(rc)) {
-        IrsImageTransferProcessorConfig cfg;
-        irsGetDefaultImageTransferProcessorConfig(&cfg);
-        cfg.format = ir_fast ? IrsImageTransferProcessorFormat_80x60 : IrsImageTransferProcessorFormat_160x120;
-        ir_w = ir_fast ? 80 : 160;
-        ir_h = ir_fast ? 60 : 120;
-        rc = irsRunImageTransferProcessor(ir_handle, &cfg, 0x100000);
+        if (ir_mode == 2) {
+            IrsClusteringProcessorConfig cc;
+            memset(&cc, 0, sizeof(cc));
+            cc.exposure_time = 200000;  // 200 us
+            cc.light_target = 0;        // all IR LEDs on: close objects (a hand) show up too
+            cc.gain = 2;
+            cc.window_of_interest.x = 0;
+            cc.window_of_interest.y = 0;
+            cc.window_of_interest.width = 320;
+            cc.window_of_interest.height = 240;
+            cc.object_pixel_count_min = 3;
+            cc.object_pixel_count_max = 320 * 240;
+            cc.object_intensity_min = 150;
+            cc.is_external_light_filter_enabled = 0;  // keep external IR (remote LEDs)
+            rc = irsRunClusteringProcessor(ir_handle, &cc);
+        } else {
+            IrsImageTransferProcessorConfig cfg;
+            irsGetDefaultImageTransferProcessorConfig(&cfg);
+            cfg.format = ir_mode == 1 ? IrsImageTransferProcessorFormat_80x60 : IrsImageTransferProcessorFormat_160x120;
+            ir_w = ir_mode == 1 ? 80 : 160;
+            ir_h = ir_mode == 1 ? 60 : 120;
+            rc = irsRunImageTransferProcessor(ir_handle, &cfg, 0x100000);
+        }
     }
     ir_running = R_SUCCEEDED(rc);
+    ir_run_mode = ir_mode;
     ir_id = id;
     ir_wireless = wireless;
-    ir_have_frame = false;
+    ir_have_data = false;
+    ir_nblobs = 0;
     ir_last_sample = 0;
     ir_last_new_tick = armGetSystemTick();
-    plat_log("ir: start id=%d wireless=%d %dx%d rc=0x%X", (int)id, wireless, ir_w, ir_h, (unsigned)rc);
+    plat_log("ir: start id=%d wireless=%d mode=%d rc=0x%X", (int)id, wireless, ir_mode, (unsigned)rc);
     if (!ir_running)
         snprintf(ir_status, sizeof(ir_status), "IR start failed (0x%X) - retrying", (unsigned)rc);
 }
@@ -700,21 +782,21 @@ void plat_ir_enable(bool on) {
     }
 }
 
-void plat_ir_set_fast(bool fast) {
-    if (fast == ir_fast) return;
-    ir_fast = fast;
+void plat_ir_set_mode(int mode) {
+    if (mode < 0 || mode > 2 || mode == ir_mode) return;
+    ir_mode = mode;
     if (ir_running) {
         ir_stop();
         ir_retry_tick = 0;
     }
 }
 
-const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len) {
+// Shared housekeeping: find the Joy-Con, (re)start the processor. False = nothing to read yet.
+static bool ir_service(u64 now, char *status, int status_len) {
     if (!ir_inited || !ir_buf) {
         snprintf(status, (size_t)status_len, "%s", ir_status);
-        return NULL;
+        return false;
     }
-    u64 now = armGetSystemTick();
     HidNpadIdType id;
     bool wl = false;
     if (!ir_find_joycon(&id, &wl)) {
@@ -723,10 +805,10 @@ const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len) {
             ir_stop();
         }
         snprintf(status, (size_t)status_len, "No right Joy-Con: attach it, or press a button on it");
-        return NULL;
+        return false;
     }
-    if (ir_running && id != ir_id) {
-        plat_log("ir: controller moved %d -> %d", (int)ir_id, (int)id);
+    if (ir_running && (id != ir_id || ir_run_mode != ir_mode)) {
+        plat_log("ir: controller/mode changed (%d -> %d)", (int)ir_id, (int)id);
         ir_stop();
         ir_retry_tick = 0;
     }
@@ -737,41 +819,265 @@ const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len) {
         }
         if (!ir_running) {
             snprintf(status, (size_t)status_len, "%s", ir_status);
-            return NULL;
+            return false;
         }
     }
-    IrsImageTransferProcessorState st;
-    memset(&st, 0, sizeof(st));
-    Result rc = irsGetImageTransferProcessorState(ir_handle, ir_buf, (size_t)(ir_w * ir_h), &st);
-    if (R_SUCCEEDED(rc) && st.sampling_number != ir_last_sample) {
-        ir_last_sample = st.sampling_number;
-        ir_last_new_tick = now;
-        ir_have_frame = true;
-        ir_fps_n++;
-    }
+    return true;
+}
+
+static void ir_got_sample(u64 now) {
+    ir_last_new_tick = now;
+    ir_have_data = true;
+    ir_fps_n++;
+}
+
+// fps + stall watchdog; false if the processor was restarted
+static bool ir_watchdog(u64 now, Result rc, char *status, int status_len) {
     if (armTicksToNs(now - ir_fps_tick) > 1000000000ULL) {
         ir_fps = ir_fps_n;
         ir_fps_n = 0;
         ir_fps_tick = now;
     }
-    // no new image for a while -> restart the processor (Joy-Con went to sleep, BT hiccup...)
     u64 limit = ir_wireless ? 6000000000ULL : 3000000000ULL;
+    // in TRACK mode an empty scene still produces samples, so the same watchdog applies
     if (armTicksToNs(now - ir_last_new_tick) > limit) {
-        plat_log("ir: no new frame for %llus (rc=0x%X) - restarting", (unsigned long long)(limit / 1000000000ULL), (unsigned)rc);
+        plat_log("ir: no new data for %llus (rc=0x%X) - restarting", (unsigned long long)(limit / 1000000000ULL), (unsigned)rc);
         ir_stop();
         ir_retry_tick = 0;
         snprintf(status, (size_t)status_len, "IR stalled - restarting...");
-        return NULL;
+        return false;
     }
-    if (!ir_have_frame) {
-        snprintf(status, (size_t)status_len, "IR starting on %s...", wl ? "wireless Joy-Con" : "handheld rail");
-        return NULL;
+    if (!ir_have_data) {
+        snprintf(status, (size_t)status_len, "IR starting on %s...", ir_wireless ? "wireless Joy-Con" : "handheld rail");
+        return false;
     }
+    return true;
+}
+
+const uint8_t *plat_ir_frame(int *w, int *h, char *status, int status_len) {
+    u64 now = armGetSystemTick();
+    if (!ir_service(now, status, status_len)) return NULL;
+    if (ir_run_mode == 2) return NULL;
+    IrsImageTransferProcessorState st;
+    memset(&st, 0, sizeof(st));
+    Result rc = irsGetImageTransferProcessorState(ir_handle, ir_buf, (size_t)(ir_w * ir_h), &st);
+    if (R_SUCCEEDED(rc) && (s64)st.sampling_number != ir_last_sample) {
+        ir_last_sample = (s64)st.sampling_number;
+        ir_got_sample(now);
+    }
+    if (!ir_watchdog(now, rc, status, status_len)) return NULL;
     snprintf(status, (size_t)status_len, "IR live: %s  %dx%d  %d fps", ir_wireless ? "wireless Joy-Con" : "handheld",
              ir_w, ir_h, ir_fps);
     *w = ir_w;
     *h = ir_h;
     return ir_buf;
+}
+
+int plat_ir_blobs(IrBlob *out, int max, char *status, int status_len) {
+    u64 now = armGetSystemTick();
+    if (!ir_service(now, status, status_len)) return -1;
+    if (ir_run_mode != 2) return -1;
+    IrsClusteringProcessorState st;
+    s32 total = 0;
+    memset(&st, 0, sizeof(st));
+    Result rc = irsGetClusteringProcessorStates(ir_handle, &st, 1, &total);
+    if (R_SUCCEEDED(rc) && total > 0 && st.sampling_number != ir_last_sample) {
+        ir_last_sample = st.sampling_number;
+        ir_got_sample(now);
+        int n = st.object_count > 16 ? 16 : st.object_count;
+        for (int i = 0; i < n; i++) {
+            const IrsClusteringData *d = &st.data[i];
+            ir_blobs[i].x = d->centroid_x;
+            ir_blobs[i].y = d->centroid_y;
+            ir_blobs[i].pixels = (int)d->pixel_count;
+            ir_blobs[i].intensity = d->average_intensity;
+            ir_blobs[i].bx = d->bound_x;
+            ir_blobs[i].by = d->bound_y;
+            ir_blobs[i].bw = d->boundt_width;
+            ir_blobs[i].bh = d->bound_height;
+        }
+        ir_nblobs = n;
+    }
+    if (!ir_watchdog(now, rc, status, status_len)) return -1;
+    snprintf(status, (size_t)status_len, "IR TRACK: %s  %d blobs  %d Hz", ir_wireless ? "wireless Joy-Con" : "handheld",
+             ir_nblobs, ir_fps);
+    int n = ir_nblobs < max ? ir_nblobs : max;
+    memcpy(out, ir_blobs, (size_t)n * sizeof(IrBlob));
+    return n;
+}
+
+// ============================================================ Wi-Fi CAN bridge
+// cannelloni (https://github.com/mguentner/cannelloni) over UDP port 20000, so a Linux laptop sees
+// the Switch as a normal SocketCAN interface:  cannelloni -I vcan0 -R <switch ip> -r 20000 -l 20000
+// Until a laptop talks to us, frames are broadcast on the local network.
+// Packet: [version=2][op=0 DATA][seq][count BE16] then per frame [id BE32 (+0x80000000 EFF)][len][data]
+#define NET_PORT 20000
+static bool net_on, net_nifm;
+static int net_fd = -1;
+static u32 net_ip;  // network byte order
+static struct sockaddr_in net_peer;
+static bool net_have_peer;
+static u8 net_seq;
+static u8 net_tx[1200];
+static int net_txlen, net_txcount;
+static unsigned net_ntx, net_nrx, net_nbad;
+static char net_err[64];
+
+static void net_close(void) {
+    if (net_fd >= 0) close(net_fd);
+    net_fd = -1;
+    if (net_nifm) nifmExit();
+    net_nifm = false;
+    socketExit();
+    net_on = false;
+}
+
+void plat_net_enable(bool on) {
+    if (on && !net_on) {
+        net_err[0] = 0;
+        if (g_safe_mode) {
+            snprintf(net_err, sizeof(net_err), "disabled in safe mode");
+            return;
+        }
+        Result rc = socketInitializeDefault();
+        plat_log("net: socketInitialize rc=0x%X", (unsigned)rc);
+        if (R_FAILED(rc)) {
+            snprintf(net_err, sizeof(net_err), "network stack unavailable (0x%X)", (unsigned)rc);
+            return;
+        }
+        net_on = true;
+        net_nifm = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
+        net_ip = 0;
+        if (net_nifm && R_FAILED(nifmGetCurrentIpAddress(&net_ip))) net_ip = 0;
+        if (!net_ip) {
+            snprintf(net_err, sizeof(net_err), "no Wi-Fi: connect the Switch to a network first");
+            plat_log("net: no IP address");
+            net_close();
+            return;
+        }
+        net_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        int one = 1;
+        if (net_fd >= 0) setsockopt(net_fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_port = htons(NET_PORT);
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (net_fd < 0 || bind(net_fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+            snprintf(net_err, sizeof(net_err), "UDP port %d unavailable (errno %d)", NET_PORT, errno);
+            plat_log("net: socket/bind failed errno=%d", errno);
+            net_close();
+            return;
+        }
+        fcntl(net_fd, F_SETFL, fcntl(net_fd, F_GETFL, 0) | O_NONBLOCK);
+        net_have_peer = false;
+        net_txlen = net_txcount = 0;
+        net_ntx = net_nrx = net_nbad = 0;
+        struct in_addr ia = {.s_addr = net_ip};
+        plat_log("net: bridge up on %s:%d", inet_ntoa(ia), NET_PORT);
+    } else if (!on && net_on) {
+        plat_log("net: bridge down (tx=%u rx=%u)", net_ntx, net_nrx);
+        net_close();
+    }
+}
+
+bool plat_net_on(void) { return net_on; }
+
+static void net_flush(void) {
+    if (!net_on || !net_txcount) return;
+    net_tx[0] = 2;  // cannelloni frame version
+    net_tx[1] = 0;  // DATA
+    net_tx[2] = net_seq++;
+    net_tx[3] = (u8)(net_txcount >> 8);
+    net_tx[4] = (u8)net_txcount;
+    struct sockaddr_in d;
+    if (net_have_peer) d = net_peer;
+    else {
+        memset(&d, 0, sizeof(d));
+        d.sin_family = AF_INET;
+        d.sin_port = htons(NET_PORT);
+        d.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    }
+    if (sendto(net_fd, net_tx, (size_t)net_txlen, 0, (struct sockaddr *)&d, sizeof(d)) > 0) net_ntx += (unsigned)net_txcount;
+    net_txlen = net_txcount = 0;
+}
+
+void plat_net_send(const CanFrame *f) {
+    if (!net_on) return;
+    if (net_txlen == 0) net_txlen = 5;
+    if (net_txlen + 13 > (int)sizeof(net_tx)) {
+        net_flush();
+        net_txlen = 5;
+    }
+    u32 id = f->ext ? ((f->id & 0x1FFFFFFF) | 0x80000000u) : (f->id & 0x7FF);
+    u8 *p = net_tx + net_txlen;
+    p[0] = (u8)(id >> 24);
+    p[1] = (u8)(id >> 16);
+    p[2] = (u8)(id >> 8);
+    p[3] = (u8)id;
+    u8 len = f->len > 8 ? 8 : f->len;
+    p[4] = len;
+    memcpy(p + 5, f->data, len);
+    net_txlen += 5 + len;
+    net_txcount++;
+}
+
+int plat_net_poll(CanFrame *out, int max) {
+    if (!net_on) return 0;
+    net_flush();
+    int n = 0;
+    u8 buf[1500];
+    for (int k = 0; k < 16 && n < max; k++) {
+        struct sockaddr_in from;
+        socklen_t fl = sizeof(from);
+        ssize_t r = recvfrom(net_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
+        if (r <= 0) break;
+        if (from.sin_addr.s_addr == net_ip) continue;  // our own broadcast looping back
+        if (r < 5 || buf[0] != 2 || buf[1] != 0) { net_nbad++; continue; }
+        if (!net_have_peer || net_peer.sin_addr.s_addr != from.sin_addr.s_addr || net_peer.sin_port != from.sin_port) {
+            struct in_addr ia = from.sin_addr;
+            plat_log("net: peer %s:%d", inet_ntoa(ia), ntohs(from.sin_port));
+        }
+        net_peer = from;
+        net_have_peer = true;
+        int cnt = buf[3] << 8 | buf[4], pos = 5;
+        for (int i = 0; i < cnt && n < max; i++) {
+            if (pos + 5 > r) { net_nbad++; break; }
+            u32 id = (u32)buf[pos] << 24 | (u32)buf[pos + 1] << 16 | (u32)buf[pos + 2] << 8 | buf[pos + 3];
+            u8 lenb = buf[pos + 4];
+            pos += 5;
+            int len = lenb & 0x7F;
+            if (lenb & 0x80) pos++;  // CAN-FD flags byte
+            if (id & 0x40000000u) len = 0;  // RTR: no payload on the wire
+            if (len > 64 || pos + len > r) { net_nbad++; break; }
+            CanFrame *f = &out[n++];
+            memset(f, 0, sizeof(*f));
+            f->ext = (id & 0x80000000u) ? 1 : 0;
+            f->id = f->ext ? (id & 0x1FFFFFFF) : (id & 0x7FF);
+            f->len = (u8)(len > 8 ? 8 : len);
+            memcpy(f->data, buf + pos, f->len);
+            pos += len;
+        }
+    }
+    net_nrx += (unsigned)n;
+    return n;
+}
+
+void plat_net_info(char *l1, int n1, char *l2, int n2, unsigned *tx, unsigned *rx) {
+    struct in_addr me = {.s_addr = net_ip};
+    if (!net_on) {
+        snprintf(l1, (size_t)n1, "%s", net_err[0] ? net_err : "off");
+        l2[0] = 0;
+    } else {
+        snprintf(l1, (size_t)n1, "%s:%d", inet_ntoa(me), NET_PORT);
+        if (net_have_peer) {
+            struct in_addr ia = net_peer.sin_addr;
+            snprintf(l2, (size_t)n2, "laptop %s:%d", inet_ntoa(ia), ntohs(net_peer.sin_port));
+        } else
+            snprintf(l2, (size_t)n2, "broadcasting - no laptop yet");
+    }
+    *tx = net_ntx;
+    *rx = net_nrx;
 }
 
 // ===================================================================== files
@@ -816,6 +1122,7 @@ int main(int argc, char **argv) {
         if (padGetButtons(&g_pad) & HidNpadButton_ZL) g_safe_mode = true;
         svcSleepThread(15000000ULL);
     }
+    log_load_previous();
     plat_log("---- CANsole NX " APP_VERSION_STR " start (safe_mode=%d, applet=%d)", g_safe_mode, (int)appletGetAppletType());
     rumble_init();
     appletSetMediaPlaybackState(true);  // keep the screen on in demo mode
@@ -862,6 +1169,7 @@ int main(int argc, char **argv) {
     rumble_send(0);
     plat_log("shutdown: app (nfc/ir off)");
     app_shutdown();
+    if (net_on) plat_net_enable(false);
     usb_stop();
     plat_log("shutdown: framebuffer");
     framebufferClose(&fb);
